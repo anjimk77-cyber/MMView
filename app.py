@@ -106,7 +106,7 @@ ul[role="listbox"], div[role="listbox"] {
 
 st.markdown("<h1 style='text-align: center;'>Shrimp FarmFlow - KMN</h1>",
             unsafe_allow_html=True)
-st.subheader("KMN Aqua Services — Marketing Manager View")
+st.subheader("KMN Aqua Services — Marketing Manager & Technician View")
 st.markdown("---")
 
 # =========================================================================
