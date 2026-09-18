@@ -721,11 +721,17 @@ if len(df_farm_summary) > 0:
 
             # Expecting Harvest (KG) / Harvest Weight line — same label
             # switch and "2nd slot wins" rule used by the full manager
-            # app's printable Farm Overview Report pond cards.
+            # app's printable Farm Overview Report pond cards. Uses the
+            # same _parse_pond_harvest_kg() parser as the "Total: X KG"
+            # line above — a plain pd.to_numeric() here would fail on a
+            # combined-harvest value like "3500 (2)" (3500kg split across
+            # 2 ponds) and silently show "-" even though a real number was
+            # saved, which is why Harvest Weight could show "-" while
+            # Total still showed the correct figure.
             if _status_box == "Full H":
                 _t2_expect = str(_prow.get("Harvest Type 2", "")).strip().lower()
-                _kg2_expect = pd.to_numeric(_prow.get("Harvest KG 2", ""), errors="coerce")
-                _kg1_expect = pd.to_numeric(_prow.get("Harvest KG", ""), errors="coerce")
+                _kg2_expect = _parse_pond_harvest_kg(_prow.get("Harvest KG 2", ""))
+                _kg1_expect = _parse_pond_harvest_kg(_prow.get("Harvest KG", ""))
                 _harvest_kg_val = _kg2_expect if ("full" in _t2_expect and pd.notna(_kg2_expect)) else _kg1_expect
                 _expect_label = "Harvest Weight"
                 _expect_val = f"{_harvest_kg_val:,.2f} KG" if pd.notna(_harvest_kg_val) else "-"
