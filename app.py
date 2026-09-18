@@ -1259,7 +1259,7 @@ else:
 # Harvest check), so it works on its own regardless of the sections above.
 # =========================================================================
 st.markdown("---")
-st.markdown("#### 🗓️ Last Visit Date Report")
+st.markdown("#### 🗓️ Last Visit Date Report (Not Visited Farms Over 7 Days ")
 
 df_all_for_last_visit = load_data()
 _last_visit_required = {"Customer", "Farm Name with Code", "Pond Number", "Date",
