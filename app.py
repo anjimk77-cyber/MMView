@@ -1,3 +1,5 @@
+import re
+
 import pandas as pd
 import streamlit as st
 from datetime import date
@@ -18,10 +20,11 @@ from google.oauth2.service_account import Credentials
 #
 # The only writes it performs are the same recycle-bin row-delete actions
 # used by the manager app: in Sales Details it writes Settle = 'Yes'
-# (Sales Details sheet); in All Harvest Details it writes Harvest Status =
-# 'H' (main WaterQualityData sheet). Both are permanent — the row stays
-# hidden after a refresh because the flag lives in the Sheet itself, not
-# just in this session. Everything else here is read-only:
+# (Sales Details sheet); in All Harvest Details it writes 'H' to
+# 'Harvest Status' (1st harvest slot) or 'Harvest Status 2' (2nd harvest
+# slot) in the main WaterQualityData sheet. Both are permanent — the row
+# stays hidden after a refresh because the flag lives in the Sheet itself,
+# not just in this session. Everything else here is read-only:
 #   1) "📋 Enter Customer Details" — Customer / Farm selection (used only
 #      to choose which farm's records to view)
 #   2) "📊 All Saved Records" + "🟦 Pond Layout" — a live, read-only view
@@ -112,9 +115,9 @@ st.markdown("---")
 # =========================================================================
 # GOOGLE SHEETS BACKEND. Read-only except for the two recycle-bin delete
 # flags: get_or_create_column() finds/creates the 'Settle' header (Sales
-# Details sheet) or 'Harvest Status' header (main sheet), and the write
-# calls that use it sit next to the Sales Details / All Harvest Details
-# tables further down.
+# Details sheet) or the 'Harvest Status' / 'Harvest Status 2' headers
+# (main sheet), and the write calls that use it sit next to the Sales
+# Details / All Harvest Details tables further down.
 # =========================================================================
 def _gsheet_configured():
     return "gcp_service_account" in st.secrets and "gsheet" in st.secrets and "sheet_id" in st.secrets["gsheet"]
@@ -147,10 +150,10 @@ def get_sales_worksheet():
 def get_or_create_column(ws, header_name):
     """Returns the 1-based column number of the given header in ws,
     creating that header (in the first empty column) if it isn't there
-    yet. Used for both 'Settle' (Sales Details sheet) and 'Harvest
-    Status' (main WaterQualityData sheet). Expands the sheet's column
-    count first if the new header would land past the sheet's current
-    grid width — writing past the grid is what raises gspread's
+    yet. Used for 'Settle' (Sales Details sheet) and 'Harvest Status' /
+    'Harvest Status 2' (main WaterQualityData sheet). Expands the sheet's
+    column count first if the new header would land past the sheet's
+    current grid width — writing past the grid is what raises gspread's
     APIError, since the underlying Sheets API rejects it."""
     headers = ws.row_values(1)
     if header_name in headers:
@@ -166,10 +169,16 @@ def load_data():
     marketing manager always sees the latest saved records — including
     anything just added by the data-entry app or edited directly in the
     Sheet. Soft-deleted rows (Deleted = Yes) are filtered out, same as the
-    data-entry app. Rows marked Harvest Status = 'H' (via the recycle-bin
-    control on the All Harvest Details table below) are filtered out the
-    same way — that flag is written straight to the Sheet, so the removal
-    persists across refreshes instead of resetting."""
+    data-entry app.
+
+    NOTE: rows flagged via the recycle-bin on the "All Harvest Details"
+    table (Harvest Status = 'H' / Harvest Status 2 = 'H') are intentionally
+    NOT filtered out here any more — same fix as the full manager app.
+    That flag is only meant to hide a harvest event from the All Harvest
+    Details table, not from every other view built on this data (All
+    Saved Records, Pond Layout). The "Harvest Status" / "Harvest Status 2"
+    columns are still read here so All Harvest Details can apply that
+    filter locally."""
     ws = get_worksheet()
     records = ws.get_all_records()
     df = pd.DataFrame(records)
@@ -178,15 +187,31 @@ def load_data():
             df[c] = ""
     if "Harvest Status" not in df.columns:
         df["Harvest Status"] = ""
+    # "Harvest Status 2" mirrors "Harvest Status" above but flags the 2nd
+    # harvest slot (Harvest Date 2 / Harvest Type 2) independently — needed
+    # because All Harvest Details now shows the 1st and 2nd harvest slots
+    # of the same saved record as two separate rows, and each needs its
+    # own recycle-bin flag so removing one slot never touches the other.
+    if "Harvest Status 2" not in df.columns:
+        df["Harvest Status 2"] = ""
+    # "Harvest Submitted Date" already exists as its own column in the
+    # Sheet (outside COLUMN_ORDER, same as "Harvest Status") — kept here
+    # so the All Harvest Details table below can offer it as a Sort by
+    # option instead of it getting dropped like any other unlisted column.
+    if "Harvest Submitted Date" not in df.columns:
+        df["Harvest Submitted Date"] = ""
+    # "WQ Special Cases" already exists as its own column in the Sheet
+    # (outside COLUMN_ORDER, same pattern as above) — kept here so the
+    # Pond Layout section below can show a sad-face icon/label on a pond
+    # whose latest record has text in this column.
+    if "WQ Special Cases" not in df.columns:
+        df["WQ Special Cases"] = ""
     if len(df) > 0:
-        df = df[COLUMN_ORDER + ["Harvest Status"]]
+        df = df[COLUMN_ORDER + ["Harvest Status", "Harvest Status 2", "Harvest Submitted Date", "WQ Special Cases"]]
     df = df.astype(str).replace("nan", "")
     if "Deleted" in df.columns:
         is_deleted = df["Deleted"].astype(str).str.strip().str.lower().isin(["yes", "true", "1"])
         df = df[~is_deleted].reset_index(drop=True)
-    if "Harvest Status" in df.columns:
-        is_harvest_hidden = df["Harvest Status"].astype(str).str.strip().str.upper() == "H"
-        df = df[~is_harvest_hidden].reset_index(drop=True)
     return df
 
 def load_sales_data():
@@ -470,10 +495,16 @@ if len(df_farm_summary) > 0:
         )
 
     # =========================================================================
-    # POND LAYOUT — one rectangle per Pond Number (using that pond's most
-    # recent saved record). Running / Partial H ponds show DOC Today
-    # centered inside the box; Full H ponds show "Full H" and its Harvest
-    # Date instead.
+    # POND LAYOUT — one card per Pond Number (using that pond's most recent
+    # saved record). This combines the interactive colored-box "Pond
+    # Layout" with the extra detail fields shown on the printable "Farm
+    # Overview Report" pond cards in the full manager app: alongside the
+    # big DOC Today / Full H / Soon to be status and the WQ Special Cases
+    # flag + Total Harvest KG, each card now also shows Stocking Density,
+    # L.V.D (that pond's own saved Date), Feed/Day, ABW, and an
+    # Expecting Harvest (KG) / Harvest Weight line — same fields, same
+    # "2nd harvest slot wins" and combined-harvest-KG parsing rules used
+    # by the full manager app's Pond Layout + Farm Overview Report.
     # =========================================================================
     if "Pond Number" in df_farm_summary.columns and "DOC Today" in df_farm_summary.columns:
         st.markdown("---")
@@ -510,6 +541,55 @@ if len(df_farm_summary) > 0:
             )
             .groupby("Pond Number")["_HasPartial"]
             .any()
+        )
+
+        # A Harvest KG / Harvest KG 2 cell is normally a plain number for a
+        # single pond. But when a Partial (or Full) Harvest is done across
+        # several ponds at once (e.g. Ponds 1 and 2 harvested together), the
+        # user enters the COMBINED total with the pond count in parentheses,
+        # e.g. "2000 (2)" — meaning 2000 kg total split across 2 ponds, and
+        # that same combined value is saved on EACH of those ponds' own
+        # rows. So this returns each pond's PER-POND share (2000 / 2 = 1000)
+        # instead of counting the full combined figure for every pond
+        # involved. Plain numeric values (no parentheses) are returned
+        # as-is; unparseable values return NaN. Same parser used by the
+        # full manager app's Pond Layout / Farm Overview Report.
+        def _parse_pond_harvest_kg(raw_value):
+            _s = str(raw_value).strip()
+            if not _s:
+                return float("nan")
+            _match = re.match(r"^([\d,]+(?:\.\d+)?)\s*\(\s*(\d+)\s*\)\s*$", _s)
+            if _match:
+                _total = pd.to_numeric(_match.group(1).replace(",", ""), errors="coerce")
+                _count = pd.to_numeric(_match.group(2), errors="coerce")
+                if pd.notna(_total) and pd.notna(_count) and _count > 0:
+                    return _total / _count
+                return float("nan")
+            return pd.to_numeric(_s.replace(",", ""), errors="coerce")
+
+        # Total Harvest KG per pond — summed across EVERY saved record for
+        # that pond (not just its latest one), so a pond that had one or
+        # more Partial H harvests and then later a Full H harvest gets both
+        # added together. Each row can contribute from both harvest slots
+        # (Harvest KG / Harvest KG 2) whenever that slot's own Harvest Type
+        # is filled in — a slot with a KG value but no Type text is skipped,
+        # same "Type must say something" guard used elsewhere in this file.
+        def _harvest_kg_sum_row(row):
+            _row_total = 0.0
+            _t1 = str(row.get("Harvest Type", "")).strip()
+            _kg1 = _parse_pond_harvest_kg(row.get("Harvest KG", ""))
+            if _t1 and pd.notna(_kg1):
+                _row_total += _kg1
+            _t2 = str(row.get("Harvest Type 2", "")).strip()
+            _kg2 = _parse_pond_harvest_kg(row.get("Harvest KG 2", ""))
+            if _t2 and pd.notna(_kg2):
+                _row_total += _kg2
+            return _row_total
+
+        _total_harvest_kg_by_pond = (
+            df_farm_summary.assign(_HarvestKGRow=df_farm_summary.apply(_harvest_kg_sum_row, axis=1))
+            .groupby("Pond Number")["_HarvestKGRow"]
+            .sum()
         )
 
         def _pond_status(prow):
@@ -551,13 +631,55 @@ if len(df_farm_summary) > 0:
             _box_color = _pond_box_color(_prow)
             _status_box = _pond_status(_prow)
 
+            # Sad-face icon shown in the top-right corner of the box when
+            # this pond's latest saved record has any text in the
+            # "WQ Special Cases" column, plus the same text repeated as a
+            # small label under the box (same pattern as the full manager
+            # app's Pond Layout).
+            _wq_special_val = str(_prow.get("WQ Special Cases", "")).strip()
+            _wq_special_icon_html = (
+                "<div style='position:absolute;top:2px;right:4px;font-size:1rem;line-height:1;' "
+                "title='WQ Special Case'>🫨</div>"
+                if _wq_special_val else ""
+            )
+            _wq_special_text_html = (
+                f"<div style='font-size:0.7rem;color:#b45309;text-align:center;"
+                f"max-width:170px;margin-top:2px;'>🫨 {_escape_html_pond(_wq_special_val)}</div>"
+                if _wq_special_val else ""
+            )
+
+            # ---- Farm-Overview-style detail lines shown on every card:
+            # Stocking Density, L.V.D (this pond's own saved Date),
+            # Feed/Day, ABW.
+            _density_val = pd.to_numeric(_prow.get("Density", ""), errors="coerce")
+            _density_str = f"{_density_val:,.0f}" if pd.notna(_density_val) else "-"
+            _lvd_str = _escape_html_pond(str(_prow.get("Date", "")).strip() or "-")
+            _feed_day_str = _escape_html_pond(_prow.get("Feed Per Day", "") or "-")
+            _abw_str = _escape_html_pond(_prow.get("ABW", "") or "-")
+            _extra_details_html = (
+                "<div style='font-size:0.68rem;color:#333;text-align:left;width:100%;"
+                "padding:0 8px;margin-top:4px;line-height:1.3;'>"
+                f"<div>Stocking Density - {_density_str}</div>"
+                f"<div>L.V.D - {_lvd_str}</div>"
+                f"<div>Feed/Day - {_feed_day_str} &nbsp;|&nbsp; ABW - {_abw_str}</div>"
+                "</div>"
+            )
+
             if _status_box == "Full H":
-                # Full H ponds: show "Full H" + its Harvest Date instead of DOC Today.
+                # Full H ponds: show "Full H" + its Harvest Date, plus the
+                # pond's Total Harvest KG (all harvests summed) instead of
+                # DOC Today.
                 _h_date = str(_prow.get("Harvest Date 2", "")).strip() or str(_prow.get("Harvest Date", "")).strip()
                 _h_date = _escape_html_pond(_h_date or "-")
+                _total_kg_box = _total_harvest_kg_by_pond.get(_prow.get("Pond Number", ""), 0)
+                _total_kg_html = (
+                    f"<div style='font-size:0.75rem;color:#333;'>Total: {_total_kg_box:,.2f} KG</div>"
+                    if _total_kg_box else ""
+                )
                 _box_middle_html = (
                     "<div style='font-size:1.2rem;font-weight:bold;color:red;'>Full H</div>"
-                    f"<div style='font-size:0.75rem;color:#333;'>{_h_date}</div>"
+                    f"<div style='font-size:0.75rem;color:#333;'>Harvest Date - {_h_date}</div>"
+                    f"{_total_kg_html}"
                 )
             elif _status_box == "Soon to be":
                 # Soon to be ponds: show "Soon to be" instead of DOC Today,
@@ -570,20 +692,59 @@ if len(df_farm_summary) > 0:
                 # Running / Partial H ponds: keep showing the DOC Today
                 # number, but the label under it now shows the pond's
                 # Started Date (today's date minus DOC Today days) instead
-                # of the literal "DOC Today" text.
+                # of the literal "DOC Today" text. Partial H ponds
+                # additionally show the pond's Total Harvest KG (all
+                # harvests summed so far) — Running ponds have no harvest
+                # yet, so this stays blank for them.
+                if _status_box == "Partial H":
+                    _total_kg_box = _total_harvest_kg_by_pond.get(_prow.get("Pond Number", ""), 0)
+                    _total_kg_html = (
+                        f"<div style='font-size:0.7rem;color:#333;'>Total: {_total_kg_box:,.2f} KG</div>"
+                        if _total_kg_box else ""
+                    )
+                else:
+                    _total_kg_html = ""
+
                 _doc_today_raw = _prow.get("DOC Today", "")
                 _doc_today_val = _escape_html_pond(_doc_today_raw or "-")
                 try:
                     _started_date = (
                         pd.Timestamp(date.today()) - pd.Timedelta(days=int(float(_doc_today_raw)))
                     ).strftime("%Y-%m-%d")
-                    _started_label = f"Started on {_started_date}"
                 except (TypeError, ValueError):
                     _started_label = "Started on ---"
+                    _started_date = None
+                if _started_date is not None:
+                    _started_label = f"Started on {_started_date}"
                 _box_middle_html = (
                     f"<div style='font-size:1.4rem;font-weight:bold;color:red;'>{_doc_today_val}</div>"
                     f"<div style='font-size:0.7rem;color:#777;'>{_escape_html_pond(_started_label)}</div>"
+                    f"{_total_kg_html}"
                 )
+
+            # Expecting Harvest (KG) / Harvest Weight line — same label
+            # switch and "2nd slot wins" rule used by the full manager
+            # app's printable Farm Overview Report pond cards.
+            if _status_box == "Full H":
+                _t2_expect = str(_prow.get("Harvest Type 2", "")).strip().lower()
+                _kg2_expect = pd.to_numeric(_prow.get("Harvest KG 2", ""), errors="coerce")
+                _kg1_expect = pd.to_numeric(_prow.get("Harvest KG", ""), errors="coerce")
+                _harvest_kg_val = _kg2_expect if ("full" in _t2_expect and pd.notna(_kg2_expect)) else _kg1_expect
+                _expect_label = "Harvest Weight"
+                _expect_val = f"{_harvest_kg_val:,.2f} KG" if pd.notna(_harvest_kg_val) else "-"
+            elif _status_box == "Soon to be":
+                _expect_label = "Expecting Harvest"
+                _expect_val = "-"
+            else:
+                _expect_label = "Expecting Harvest"
+                _expect_kg = pd.to_numeric(_prow.get("Expect Harvest (KG)", ""), errors="coerce")
+                _expect_val = f"{_expect_kg:,.2f} KG" if pd.notna(_expect_kg) else "-"
+
+            _expect_html = (
+                "<div style='font-size:0.7rem;color:#333;text-align:center;width:100%;margin-top:4px;"
+                "border-top:1px dashed #bbb;padding-top:3px;'>"
+                f"<b>{_expect_label}:</b> {_escape_html_pond(_expect_val)}</div>"
+            )
 
             _species_label = _species_letter(_prow)
             _species_html = (
@@ -593,13 +754,17 @@ if len(df_farm_summary) > 0:
 
             _pond_boxes_html += (
                 "<div style='display:flex;flex-direction:column;align-items:center;margin:6px;'>"
-                f"<div style='width:140px;height:90px;border:2px solid #333;border-radius:6px;"
-                "display:flex;flex-direction:column;align-items:center;justify-content:center;"
-                f"background:{_box_color};'>"
+                f"<div style='position:relative;width:190px;min-height:160px;border:2px solid #333;"
+                "border-radius:6px;display:flex;flex-direction:column;align-items:center;"
+                f"justify-content:flex-start;padding:8px 0;background:{_box_color};'>"
+                f"{_wq_special_icon_html}"
                 f"<div style='font-size:0.8rem;color:#555;'>Pond {_pond_no}</div>"
                 f"{_box_middle_html}"
+                f"{_expect_html}"
+                f"{_extra_details_html}"
                 "</div>"
                 f"{_species_html}"
+                f"{_wq_special_text_html}"
                 "</div>"
             )
 
@@ -863,8 +1028,22 @@ if df_sales is not None:
 # ALL HARVEST DETAILS — every row (across ALL customers/farms/ponds in the
 # Google Sheet, not just the one selected above) that has a non-blank
 # value in EITHER harvest slot: Harvest Date/Type (the first harvest) or
-# Harvest Date 2/Type 2 (a second harvest for the same pond row). Read-only,
-# straight from the Sheet.
+# Harvest Date 2/Type 2 (a second harvest for the same pond row).
+#
+# A sheet row that has BOTH slots filled in (a Partial harvest followed
+# later by a Full harvest on the same pond record) is shown here as TWO
+# SEPARATE ROWS — one per harvest event — so each can be reviewed and
+# removed on its own via the recycle bin, without affecting the other
+# harvest event on that same underlying sheet row. This split is purely a
+# display/edit-time thing: nothing is duplicated, merged, or deleted in
+# the Google Sheet because of it. Same logic as the full manager app.
+#
+# The recycle-bin delete on this table writes a flag to the main Sheet —
+# 'Harvest Status' = 'H' for the 1st harvest slot's row, 'Harvest Status 2'
+# = 'H' for the 2nd slot's row — and that flag is filtered out ONLY here.
+# It does NOT affect All Saved Records or Pond Layout above, since those
+# read load_data() directly and load_data() never filters on either
+# Harvest Status column.
 #
 # This is the last section in the Marketing Manager view — the Zone-Wise
 # Harvest breakdown, Running List, and Species-wise Pond Summary sections
@@ -882,21 +1061,16 @@ if len(df_all_records) > 0 and _harvest_cols_needed.issubset(df_all_records.colu
         | (df_all_records["Harvest Date 2"].astype(str).str.strip() != "")
         | (df_all_records["Harvest Type 2"].astype(str).str.strip() != "")
     )
-    df_harvest_all = df_all_records[_harvest_mask].copy()
+    df_harvest_source = df_all_records[_harvest_mask].copy()
 else:
-    df_harvest_all = pd.DataFrame(columns=COLUMN_ORDER)
+    df_harvest_source = pd.DataFrame(columns=COLUMN_ORDER)
 
-if len(df_harvest_all) > 0:
-    # The "DOC" column shown in the All Harvest Details table is DOC-as-
-    # of-today for a row that hasn't reached Full Harvest yet — but for a
-    # row whose Harvest Type (checking the more recent Harvest Type 2
-    # first, then Harvest Type) says "Full", DOC instead STOPS ADVANCING
-    # at that row's Full Harvest date, since the pond was fully harvested
-    # there and DOC shouldn't keep counting up to today. Uses the row's
-    # own saved "Date" field (captured here before the Timestamp-based
-    # "Date" override just below) as the elapsed-days starting point —
-    # the same basis "DOC" is always computed from elsewhere in this
-    # file. This only affects this table.
+if len(df_harvest_source) > 0:
+    # "DOC" and "Date" below are computed ONCE per underlying sheet row
+    # (unchanged formulas — DOC checks whichever slot's Type says "Full",
+    # 2nd slot first; Date uses the Timestamp's own date) and then carried
+    # onto BOTH split rows for that sheet row, since they describe the
+    # saved record as a whole rather than one harvest slot specifically.
     def _harvest_doc_display(row):
         try:
             _doc_num = int(float(row.get("DOC")))
@@ -918,37 +1092,126 @@ if len(df_harvest_all) > 0:
                 return str(_doc_num + (_full_harvest_date - _row_date).days)
         return str(_doc_num + (pd.Timestamp(date.today()) - _row_date).days)
 
-    if "DOC" in df_harvest_all.columns:
-        df_harvest_all["DOC"] = df_harvest_all.apply(_harvest_doc_display, axis=1)
+    df_harvest_source["DOC"] = df_harvest_source.apply(_harvest_doc_display, axis=1)
 
-    # The "Date" column shown in the All Harvest Details table is the
-    # LATEST DATE THE USER ACTUALLY SUBMITTED the harvest record — i.e.
-    # the date portion of "Timestamp" — rather than the row's saved
-    # "Date" field. Falls back to the original "Date" value if a row's
-    # Timestamp can't be parsed. This only affects this table.
-    if "Timestamp" in df_harvest_all.columns:
+    if "Timestamp" in df_harvest_source.columns:
         _harvest_timestamp_date = pd.to_datetime(
-            df_harvest_all["Timestamp"], errors="coerce"
+            df_harvest_source["Timestamp"], errors="coerce"
         ).dt.strftime("%Y-%m-%d")
-        df_harvest_all["Date"] = _harvest_timestamp_date.fillna(df_harvest_all["Date"])
+        df_harvest_source["Date"] = _harvest_timestamp_date.fillna(df_harvest_source["Date"])
 
+    # ---- split each qualifying sheet row into one row per filled harvest
+    # slot. Each split row carries a "_SlotKey" (Timestamp + which slot)
+    # used only internally to track recycle-bin deletions below — it is
+    # never shown in the table.
+    _split_rows = []
+    for _, _r in df_harvest_source.iterrows():
+        _status1 = str(_r.get("Harvest Status", "")).strip().upper()
+        _status2 = str(_r.get("Harvest Status 2", "")).strip().upper()
+        _slot1_filled = (
+            str(_r.get("Harvest Date", "")).strip() != "" or str(_r.get("Harvest Type", "")).strip() != ""
+        )
+        _slot2_filled = (
+            str(_r.get("Harvest Date 2", "")).strip() != "" or str(_r.get("Harvest Type 2", "")).strip() != ""
+        )
+        if _slot1_filled and _status1 != "H":
+            _row1 = _r.to_dict()
+            _row1["_SlotKey"] = f"{_r.get('Timestamp', '')}__1"
+            _split_rows.append(_row1)
+        if _slot2_filled and _status2 != "H":
+            _row2 = _r.to_dict()
+            _row2["_SlotKey"] = f"{_r.get('Timestamp', '')}__2"
+            _row2["Harvest Date"] = _r.get("Harvest Date 2", "")
+            _row2["Harvest Type"] = _r.get("Harvest Type 2", "")
+            _row2["Harvest KG"] = _r.get("Harvest KG 2", "")
+            _row2["Harvest ABW"] = _r.get("Harvest ABW 2", "")
+            _split_rows.append(_row2)
+
+    df_harvest_all = (
+        pd.DataFrame(_split_rows) if _split_rows
+        else df_harvest_source.iloc[0:0].assign(_SlotKey=pd.Series(dtype=str))
+    )
+else:
+    df_harvest_all = pd.DataFrame(columns=COLUMN_ORDER)
+
+if len(df_harvest_all) > 0:
     if "Date" in df_harvest_all.columns:
         df_harvest_all["_ParsedDate"] = pd.to_datetime(df_harvest_all["Date"], errors="coerce")
         _harvest_sort_cols = [c for c in ["Customer", "Farm Name with Code", "Pond Number"]
                                if c in df_harvest_all.columns] + ["_ParsedDate"]
         df_harvest_all = df_harvest_all.sort_values(by=_harvest_sort_cols).drop(columns=["_ParsedDate"])
+
+    # "Estimated Harvest Value" — a self-contained per-row estimate:
+    #   price per KG = 1500 + 20 for every 1g of ABW above 10
+    #   Estimated Harvest Value = price per KG * Harvest KG
+    # e.g. Harvest KG 1200, ABW 13 -> (1500 + 20*(13-10)) * 1200.
+    #
+    # Harvest KG can be a combined figure across several ponds written as
+    # "1500 (3)" (1500 total split across 3 ponds) — same pattern already
+    # parsed elsewhere in this file (Pond Layout's _parse_pond_harvest_kg)
+    # — so that's parsed into a per-pond share (1500 / 3) here too, via a
+    # local copy of that same parser so this section stays self-contained.
+    # Harvest ABW can likewise be a range like "9-11" — parsed as its
+    # midpoint, (9+11)/2 = 10.
+    def _harvest_value_parse_kg(raw_value):
+        _s = str(raw_value).strip()
+        if not _s:
+            return float("nan")
+        _match = re.match(r"^([\d,]+(?:\.\d+)?)\s*\(\s*(\d+)\s*\)\s*$", _s)
+        if _match:
+            _total = pd.to_numeric(_match.group(1).replace(",", ""), errors="coerce")
+            _count = pd.to_numeric(_match.group(2), errors="coerce")
+            if pd.notna(_total) and pd.notna(_count) and _count > 0:
+                return _total / _count
+            return float("nan")
+        return pd.to_numeric(_s.replace(",", ""), errors="coerce")
+
+    def _harvest_value_parse_abw(raw_value):
+        _s = str(raw_value).strip()
+        if not _s:
+            return float("nan")
+        _range_match = re.match(r"^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$", _s)
+        if _range_match:
+            _lo = pd.to_numeric(_range_match.group(1), errors="coerce")
+            _hi = pd.to_numeric(_range_match.group(2), errors="coerce")
+            if pd.notna(_lo) and pd.notna(_hi):
+                return (_lo + _hi) / 2
+            return float("nan")
+        return pd.to_numeric(_s, errors="coerce")
+
+    def _harvest_estimated_value(row):
+        _kg_val = _harvest_value_parse_kg(row.get("Harvest KG", ""))
+        _abw_val = _harvest_value_parse_abw(row.get("Harvest ABW", ""))
+        if pd.isna(_kg_val) or pd.isna(_abw_val):
+            return ""
+        _price_per_kg = 1500 + 20 * (_abw_val - 10)
+        return f"{_price_per_kg * _kg_val:,.2f}"
+
+    df_harvest_all["Estimated Harvest Value"] = df_harvest_all.apply(_harvest_estimated_value, axis=1)
+
+    # NOTE: "Cycle Type" intentionally left out of this table's display
+    # columns — same as the full manager app. "Harvest Date 2" /
+    # "Harvest Type 2" / "Harvest KG 2" / "Harvest ABW 2" are also left
+    # out now — each harvest slot gets its own row above, so the single
+    # "Harvest Date/Type/KG/ABW" columns already carry whichever slot
+    # that row represents.
     _harvest_display_cols = ["Customer", "Farm Name with Code", "Pond Number", "Date", "DOC",
-                              "Species Culture", "Cycle Type", "Harvest Date", "Harvest Type",
-                              "Harvest KG", "Harvest ABW", "Harvest Date 2", "Harvest Type 2",
-                              "Harvest KG 2", "Harvest ABW 2", "Technician"]
+                              "Species Culture", "Harvest Date", "Harvest Type",
+                              "Harvest KG", "Harvest ABW", "Estimated Harvest Value",
+                              "Harvest Submitted Date", "Technician"]
     _harvest_display_cols = [c for c in _harvest_display_cols if c in df_harvest_all.columns]
 
     st.caption(
         "🗑️ Select a row's checkbox (left edge) then click the recycle-bin icon above the "
-        "table to remove that record — this writes 'H' to a Harvest Status column in the "
-        "Google Sheet, so it stays removed after a refresh."
+        "table to remove that harvest record. A saved record with both a Partial and a Full "
+        "harvest is shown here as two separate rows — one per harvest event — and each can be "
+        "removed on its own without affecting the other. Removing the 1st harvest event writes "
+        "'H' to a 'Harvest Status' column in the Google Sheet; removing the 2nd writes 'H' to a "
+        "'Harvest Status 2' column — either way it stays removed after a refresh, and nothing is "
+        "ever deleted from the Sheet. This only hides it from the All Harvest Details table — it "
+        "still shows up everywhere else on this page (All Saved Records, Pond Layout)."
     )
-    _harvest_full_cols = ["Timestamp"] + _harvest_display_cols
+    _harvest_full_cols = ["_SlotKey", "Timestamp"] + _harvest_display_cols
     df_harvest_editor_source = df_harvest_all[_harvest_full_cols].reset_index(drop=True)
 
     # Streamlit turns OFF its built-in click-to-sort on data_editor tables
@@ -956,10 +1219,14 @@ if len(df_harvest_all) > 0:
     # recycle-bin delete) — that's a Streamlit-level constraint, not
     # something togglable from here. So sorting is offered manually via
     # these two controls instead, applied to the data before it's handed
-    # to the editor.
+    # to the editor. Defaults to "Harvest Submitted Date" / Descending so
+    # the most recently submitted harvests show up first.
     _hsort_col1, _hsort_col2 = st.columns(2)
     with _hsort_col1:
-        _default_sort_idx = _harvest_display_cols.index("Date") if "Date" in _harvest_display_cols else 0
+        _default_sort_idx = (
+            _harvest_display_cols.index("Harvest Submitted Date")
+            if "Harvest Submitted Date" in _harvest_display_cols else 0
+        )
         _harvest_sort_by = st.selectbox(
             "Sort by", options=_harvest_display_cols, index=_default_sort_idx, key="harvest_sort_by"
         )
@@ -994,24 +1261,31 @@ if len(df_harvest_all) > 0:
         disabled=_harvest_display_cols,
     )
 
-    # A Timestamp missing from edited_harvest_all was just removed via the
-    # recycle bin — mark that row's Harvest Status = 'H' in the main Sheet
-    # so the removal persists.
-    removed_timestamps = set(df_harvest_editor_source["Timestamp"]) - set(edited_harvest_all["Timestamp"].dropna())
-    if removed_timestamps:
+    # A "_SlotKey" missing from edited_harvest_all was just removed via the
+    # recycle bin — mark that harvest event's flag in the main Sheet so the
+    # removal persists. "_SlotKey" is "<Timestamp>__1" or "<Timestamp>__2"
+    # — the suffix picks which flag column gets the 'H', so the other
+    # harvest slot on that same sheet row is left untouched.
+    removed_slot_keys = set(df_harvest_editor_source["_SlotKey"]) - set(edited_harvest_all["_SlotKey"].dropna())
+    if removed_slot_keys:
         try:
             ws_main = get_worksheet()
             harvest_status_col_idx = get_or_create_column(ws_main, "Harvest Status")
-            for _ts in removed_timestamps:
-                _cell = ws_main.find(str(_ts), in_column=1)
+            harvest_status2_col_idx = get_or_create_column(ws_main, "Harvest Status 2")
+            for _slot_key in removed_slot_keys:
+                _ts_part, _, _slot_part = str(_slot_key).rpartition("__")
+                if not _ts_part:
+                    continue
+                _cell = ws_main.find(_ts_part, in_column=1)
                 if _cell:
-                    ws_main.update_cell(_cell.row, harvest_status_col_idx, "H")
+                    _target_col_idx = harvest_status_col_idx if _slot_part == "1" else harvest_status2_col_idx
+                    ws_main.update_cell(_cell.row, _target_col_idx, "H")
             st.rerun()
         except gspread.exceptions.APIError as e:
             st.error(f"❌ Could not save that removal to the Google Sheet. Please try again.\n\n{e}")
 
     _num_harvest_hidden = len(df_harvest_editor_source) - len(edited_harvest_all)
-    _harvest_caption = f"{len(edited_harvest_all)} harvested record(s) shown."
+    _harvest_caption = f"{len(edited_harvest_all)} harvest record(s) shown."
     if _num_harvest_hidden:
         _harvest_caption += f" ({_num_harvest_hidden} row(s) hidden in this view.)"
     st.caption(_harvest_caption)
