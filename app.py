@@ -1251,6 +1251,10 @@ else:
 # Due Date = days elapsed between today and Data Entered Latest Date
 # (today's date minus that date, in days).
 #
+# Only rows with Status = "Running" AND Due Date > 7 are shown, so this
+# report only surfaces farms that are overdue for a visit — farms at
+# FULL H, or Running farms visited within the last 7 days, are left out.
+#
 # Entirely read-only, self-contained (own local Zone lookup and Full
 # Harvest check), so it works on its own regardless of the sections above.
 # =========================================================================
@@ -1310,10 +1314,26 @@ if len(df_all_for_last_visit) > 0 and _last_visit_required.issubset(df_all_for_l
     _farm_last_visit["Data Entered Latest Date"] = _farm_last_visit["_LatestDateParsed"].dt.strftime(
         "%Y-%m-%d"
     ).fillna("-")
-    _farm_last_visit["Due Date"] = _farm_last_visit["_LatestDateParsed"].apply(
-        lambda d: str((_today_last_visit - d).days) if pd.notna(d) else "-"
+    # "_DueDateNum" (numeric days-elapsed, kept only for filtering below)
+    # is computed alongside the display "Due Date" string so a farm with
+    # no parsed date at all (shown as "-") is treated as not overdue
+    # rather than crashing the > 7 comparison.
+    _farm_last_visit["_DueDateNum"] = _farm_last_visit["_LatestDateParsed"].apply(
+        lambda d: (_today_last_visit - d).days if pd.notna(d) else None
+    )
+    _farm_last_visit["Due Date"] = _farm_last_visit["_DueDateNum"].apply(
+        lambda n: str(n) if n is not None else "-"
     )
     _farm_last_visit = _farm_last_visit.drop(columns=["_LatestDateParsed"])
+
+    # Only farms that are still Running AND overdue by more than 7 days
+    # get shown in this report — FULL H farms and farms visited within
+    # the last 7 days are filtered out here, before the Zone filter below.
+    _farm_last_visit = _farm_last_visit[
+        (_farm_last_visit["Status"] == "Running")
+        & (_farm_last_visit["_DueDateNum"].notna())
+        & (_farm_last_visit["_DueDateNum"] > 7)
+    ].drop(columns=["_DueDateNum"])
 
     # Attach Zone (from Customer List.xlsx), same lookup pattern used
     # elsewhere in this file.
