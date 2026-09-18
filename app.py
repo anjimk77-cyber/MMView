@@ -866,6 +866,29 @@ if df_sales is not None:
                 hide_index=True,
             )
 
+            # Last Feed Order — the most recent date on which any FEED
+            # item ("Item No." starting with "FEED", same prefix check
+            # used for the Total Quantity/Total Sales Amt figures below)
+            # was purchased for this farm, plus the total feed Quantity
+            # bought on that date. Uses df_sales_farm (not yet filtered to
+            # visible/kept dates) so a settled date's last feed order still
+            # shows here even if that date's row is excluded from the
+            # pivot table above.
+            _last_feed_mask = (
+                df_sales_farm["Item No."].astype(str).str.strip().str.upper().str.startswith("FEED")
+            )
+            df_last_feed = df_sales_farm[_last_feed_mask]
+            if len(df_last_feed) > 0:
+                _last_feed_date = df_last_feed["Date"].max()
+                _last_feed_qty = df_last_feed.loc[
+                    df_last_feed["Date"] == _last_feed_date, "Quantity"
+                ].sum()
+                st.markdown(
+                    f"**Last Feed Order: {_last_feed_qty:,.0f}  |  Last Feed Purchased Date: {_last_feed_date}**"
+                )
+            else:
+                st.markdown("**Last Feed Order: -  |  Last Feed Purchased Date: -**")
+
             kept_dates = pivot_display["Date"].dropna()
 
             df_sales_farm_visible = df_sales_farm[df_sales_farm["Date"].isin(kept_dates)]
@@ -1259,7 +1282,7 @@ else:
 # Harvest check), so it works on its own regardless of the sections above.
 # =========================================================================
 st.markdown("---")
-st.markdown("#### 🗓️ Last Visit Date Report (Not Visited Farms Over 7 Days)")
+st.markdown("#### 🗓️ Last Visit Date Report")
 
 df_all_for_last_visit = load_data()
 _last_visit_required = {"Customer", "Farm Name with Code", "Pond Number", "Date",
