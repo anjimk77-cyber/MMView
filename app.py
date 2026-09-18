@@ -18,13 +18,12 @@ from google.oauth2.service_account import Credentials
 # the Zone-Wise Harvest breakdown, the Running List, or the Species-wise
 # Pond Summary sections that the manager app has further down the page.
 #
-# The only writes it performs are the same recycle-bin row-delete actions
-# used by the manager app: in Sales Details it writes Settle = 'Yes'
-# (Sales Details sheet); in All Harvest Details it writes 'H' to
-# 'Harvest Status' (1st harvest slot) or 'Harvest Status 2' (2nd harvest
-# slot) in the main WaterQualityData sheet. Both are permanent — the row
-# stays hidden after a refresh because the flag lives in the Sheet itself,
-# not just in this session. Everything else here is read-only:
+# This app is VIEW-ONLY for Technical Officers & Marketing Managers — the
+# only write it performs anywhere is the Sales Details recycle-bin action
+# (writes Settle = 'Yes' in the Sales Details sheet, so a removed sales
+# date stays hidden after a refresh). All Harvest Details below has NO
+# delete/recycle-bin control — it is a plain read-only table. Everything
+# else here is read-only:
 #   1) "📋 Enter Customer Details" — Customer / Farm selection (used only
 #      to choose which farm's records to view)
 #   2) "📊 All Saved Records" + "🟦 Pond Layout" — a live, read-only view
@@ -113,11 +112,10 @@ st.subheader("KMN Aqua Services — Marketing Manager & Technician View")
 st.markdown("---")
 
 # =========================================================================
-# GOOGLE SHEETS BACKEND. Read-only except for the two recycle-bin delete
-# flags: get_or_create_column() finds/creates the 'Settle' header (Sales
-# Details sheet) or the 'Harvest Status' / 'Harvest Status 2' headers
-# (main sheet), and the write calls that use it sit next to the Sales
-# Details / All Harvest Details tables further down.
+# GOOGLE SHEETS BACKEND. Read-only except for the Sales Details recycle-bin
+# flag: get_or_create_column() finds/creates the 'Settle' header (Sales
+# Details sheet), and the write call that uses it sits next to the Sales
+# Details table further down. All Harvest Details never writes anything.
 # =========================================================================
 def _gsheet_configured():
     return "gcp_service_account" in st.secrets and "gsheet" in st.secrets and "sheet_id" in st.secrets["gsheet"]
@@ -171,14 +169,13 @@ def load_data():
     Sheet. Soft-deleted rows (Deleted = Yes) are filtered out, same as the
     data-entry app.
 
-    NOTE: rows flagged via the recycle-bin on the "All Harvest Details"
-    table (Harvest Status = 'H' / Harvest Status 2 = 'H') are intentionally
-    NOT filtered out here any more — same fix as the full manager app.
-    That flag is only meant to hide a harvest event from the All Harvest
-    Details table, not from every other view built on this data (All
-    Saved Records, Pond Layout). The "Harvest Status" / "Harvest Status 2"
-    columns are still read here so All Harvest Details can apply that
-    filter locally."""
+    NOTE: this app never writes 'Harvest Status' / 'Harvest Status 2' —
+    there is no delete/recycle-bin control on "All Harvest Details" here
+    (view-only for Technical Officers & Marketing Managers). The two
+    columns are still read (and still respected if a value was set by the
+    full manager app elsewhere) so a harvest event hidden there is also
+    hidden from this app's All Harvest Details table — but nothing here
+    can set that flag itself."""
     ws = get_worksheet()
     records = ws.get_all_records()
     df = pd.DataFrame(records)
@@ -1035,15 +1032,15 @@ if df_sales is not None:
 # SEPARATE ROWS — one per harvest event — so each can be reviewed and
 # removed on its own via the recycle bin, without affecting the other
 # harvest event on that same underlying sheet row. This split is purely a
-# display/edit-time thing: nothing is duplicated, merged, or deleted in
-# the Google Sheet because of it. Same logic as the full manager app.
+# display-time thing: nothing is duplicated, merged, or deleted in the
+# Google Sheet because of it.
 #
-# The recycle-bin delete on this table writes a flag to the main Sheet —
-# 'Harvest Status' = 'H' for the 1st harvest slot's row, 'Harvest Status 2'
-# = 'H' for the 2nd slot's row — and that flag is filtered out ONLY here.
-# It does NOT affect All Saved Records or Pond Layout above, since those
-# read load_data() directly and load_data() never filters on either
-# Harvest Status column.
+# VIEW-ONLY: unlike the full manager app, this table has NO recycle-bin /
+# delete control — Technical Officers & Marketing Managers can only view
+# these records here, never remove one. A harvest event already flagged
+# 'H' (Harvest Status / Harvest Status 2) by the full manager app is still
+# hidden from this table (same read-only filter as before), but nothing on
+# this page can set that flag itself.
 #
 # This is the last section in the Marketing Manager view — the Zone-Wise
 # Harvest breakdown, Running List, and Species-wise Pond Summary sections
@@ -1201,26 +1198,17 @@ if len(df_harvest_all) > 0:
                               "Harvest Submitted Date", "Technician"]
     _harvest_display_cols = [c for c in _harvest_display_cols if c in df_harvest_all.columns]
 
-    st.caption(
-        "🗑️ Select a row's checkbox (left edge) then click the recycle-bin icon above the "
-        "table to remove that harvest record. A saved record with both a Partial and a Full "
-        "harvest is shown here as two separate rows — one per harvest event — and each can be "
-        "removed on its own without affecting the other. Removing the 1st harvest event writes "
-        "'H' to a 'Harvest Status' column in the Google Sheet; removing the 2nd writes 'H' to a "
-        "'Harvest Status 2' column — either way it stays removed after a refresh, and nothing is "
-        "ever deleted from the Sheet. This only hides it from the All Harvest Details table — it "
-        "still shows up everywhere else on this page (All Saved Records, Pond Layout)."
-    )
+    # NOTE: This app is a VIEW-ONLY app for Technical Officers & Marketing
+    # Managers — unlike the full manager app, there is intentionally no
+    # recycle-bin / delete affordance here. The table below is a plain
+    # read-only st.dataframe; nothing on this page can flag or hide a
+    # harvest record in the Google Sheet.
     _harvest_full_cols = ["_SlotKey", "Timestamp"] + _harvest_display_cols
-    df_harvest_editor_source = df_harvest_all[_harvest_full_cols].reset_index(drop=True)
+    df_harvest_view_source = df_harvest_all[_harvest_full_cols].reset_index(drop=True)
 
-    # Streamlit turns OFF its built-in click-to-sort on data_editor tables
-    # whenever num_rows="dynamic" is set (needed just below for the
-    # recycle-bin delete) — that's a Streamlit-level constraint, not
-    # something togglable from here. So sorting is offered manually via
-    # these two controls instead, applied to the data before it's handed
-    # to the editor. Defaults to "Harvest Submitted Date" / Descending so
-    # the most recently submitted harvests show up first.
+    # Manual Sort by / Order controls (kept from before, purely for
+    # viewing convenience). Defaults to "Harvest Submitted Date" /
+    # Descending so the most recently submitted harvests show up first.
     _hsort_col1, _hsort_col2 = st.columns(2)
     with _hsort_col1:
         _default_sort_idx = (
@@ -1244,51 +1232,19 @@ if len(df_harvest_all) > 0:
             return parsed_dt
         return series.astype(str).str.lower()
 
-    df_harvest_editor_source = (
-        df_harvest_editor_source.assign(_SortKey=_harvest_sort_key(df_harvest_editor_source[_harvest_sort_by]))
+    df_harvest_view_source = (
+        df_harvest_view_source.assign(_SortKey=_harvest_sort_key(df_harvest_view_source[_harvest_sort_by]))
         .sort_values(by="_SortKey", ascending=(_harvest_sort_order == "Ascending"), na_position="last")
         .drop(columns=["_SortKey"])
         .reset_index(drop=True)
     )
 
-    edited_harvest_all = st.data_editor(
-        df_harvest_editor_source,
+    st.dataframe(
+        df_harvest_view_source[_harvest_display_cols],
         use_container_width=True,
         hide_index=True,
-        key="harvest_all_editor",
-        num_rows="dynamic",
-        column_order=_harvest_display_cols,
-        disabled=_harvest_display_cols,
     )
-
-    # A "_SlotKey" missing from edited_harvest_all was just removed via the
-    # recycle bin — mark that harvest event's flag in the main Sheet so the
-    # removal persists. "_SlotKey" is "<Timestamp>__1" or "<Timestamp>__2"
-    # — the suffix picks which flag column gets the 'H', so the other
-    # harvest slot on that same sheet row is left untouched.
-    removed_slot_keys = set(df_harvest_editor_source["_SlotKey"]) - set(edited_harvest_all["_SlotKey"].dropna())
-    if removed_slot_keys:
-        try:
-            ws_main = get_worksheet()
-            harvest_status_col_idx = get_or_create_column(ws_main, "Harvest Status")
-            harvest_status2_col_idx = get_or_create_column(ws_main, "Harvest Status 2")
-            for _slot_key in removed_slot_keys:
-                _ts_part, _, _slot_part = str(_slot_key).rpartition("__")
-                if not _ts_part:
-                    continue
-                _cell = ws_main.find(_ts_part, in_column=1)
-                if _cell:
-                    _target_col_idx = harvest_status_col_idx if _slot_part == "1" else harvest_status2_col_idx
-                    ws_main.update_cell(_cell.row, _target_col_idx, "H")
-            st.rerun()
-        except gspread.exceptions.APIError as e:
-            st.error(f"❌ Could not save that removal to the Google Sheet. Please try again.\n\n{e}")
-
-    _num_harvest_hidden = len(df_harvest_editor_source) - len(edited_harvest_all)
-    _harvest_caption = f"{len(edited_harvest_all)} harvest record(s) shown."
-    if _num_harvest_hidden:
-        _harvest_caption += f" ({_num_harvest_hidden} row(s) hidden in this view.)"
-    st.caption(_harvest_caption)
+    st.caption(f"{len(df_harvest_view_source)} harvest record(s) shown.")
 else:
     st.info("No harvest details recorded yet.")
 
