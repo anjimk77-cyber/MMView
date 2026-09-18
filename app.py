@@ -18,12 +18,12 @@ from google.oauth2.service_account import Credentials
 # the Zone-Wise Harvest breakdown, the Running List, or the Species-wise
 # Pond Summary sections that the manager app has further down the page.
 #
-# This app is VIEW-ONLY for Technical Officers & Marketing Managers — the
-# only write it performs anywhere is the Sales Details recycle-bin action
-# (writes Settle = 'Yes' in the Sales Details sheet, so a removed sales
-# date stays hidden after a refresh). All Harvest Details below has NO
-# delete/recycle-bin control — it is a plain read-only table. Everything
-# else here is read-only:
+# This app is VIEW-ONLY for Technical Officers & Marketing Managers — it
+# performs NO writes to either Google Sheet. Sales Details and All Harvest
+# Details both have no delete/recycle-bin control; a row already flagged
+# as removed/settled by the full manager app (Settle = 'Yes', or Harvest
+# Status = 'H') stays hidden here too, but nothing on this page can set
+# either flag itself. Everything here is read-only:
 #   1) "📋 Enter Customer Details" — Customer / Farm selection (used only
 #      to choose which farm's records to view)
 #   2) "📊 All Saved Records" + "🟦 Pond Layout" — a live, read-only view
@@ -112,10 +112,10 @@ st.subheader("KMN Aqua Services — Marketing Manager & Technician View")
 st.markdown("---")
 
 # =========================================================================
-# GOOGLE SHEETS BACKEND. Read-only except for the Sales Details recycle-bin
-# flag: get_or_create_column() finds/creates the 'Settle' header (Sales
-# Details sheet), and the write call that uses it sits next to the Sales
-# Details table further down. All Harvest Details never writes anything.
+# GOOGLE SHEETS BACKEND. Entirely read-only — this app never writes to
+# either Google Sheet. get_or_create_column() is kept only because
+# get_worksheet()/get_sales_worksheet() below are shared helpers with the
+# other apps in this family; nothing in this file calls it anymore.
 # =========================================================================
 def _gsheet_configured():
     return "gcp_service_account" in st.secrets and "gsheet" in st.secrets and "sheet_id" in st.secrets["gsheet"]
@@ -654,8 +654,8 @@ if len(df_farm_summary) > 0:
             _feed_day_str = _escape_html_pond(_prow.get("Feed Per Day", "") or "-")
             _abw_str = _escape_html_pond(_prow.get("ABW", "") or "-")
             _extra_details_html = (
-                "<div style='font-size:0.68rem;color:#333;text-align:left;width:100%;"
-                "padding:0 8px;margin-top:4px;line-height:1.3;'>"
+                "<div style='font-size:0.85rem;color:#333;text-align:left;width:100%;"
+                "padding:0 8px;margin-top:4px;line-height:1.4;'>"
                 f"<div>Stocking Density - {_density_str}</div>"
                 f"<div>L.V.D - {_lvd_str}</div>"
                 f"<div>Feed/Day - {_feed_day_str} &nbsp;|&nbsp; ABW - {_abw_str}</div>"
@@ -738,7 +738,7 @@ if len(df_farm_summary) > 0:
                 _expect_val = f"{_expect_kg:,.2f} KG" if pd.notna(_expect_kg) else "-"
 
             _expect_html = (
-                "<div style='font-size:0.7rem;color:#333;text-align:center;width:100%;margin-top:4px;"
+                "<div style='font-size:0.85rem;color:#333;text-align:center;width:100%;margin-top:4px;"
                 "border-top:1px dashed #bbb;padding-top:3px;'>"
                 f"<b>{_expect_label}:</b> {_escape_html_pond(_expect_val)}</div>"
             )
@@ -751,7 +751,7 @@ if len(df_farm_summary) > 0:
 
             _pond_boxes_html += (
                 "<div style='display:flex;flex-direction:column;align-items:center;margin:6px;'>"
-                f"<div style='position:relative;width:190px;min-height:160px;border:2px solid #333;"
+                f"<div style='position:relative;width:210px;min-height:175px;border:2px solid #333;"
                 "border-radius:6px;display:flex;flex-direction:column;align-items:center;"
                 f"justify-content:flex-start;padding:8px 0;background:{_box_color};'>"
                 f"{_wq_special_icon_html}"
@@ -785,13 +785,11 @@ else:
     st.info(f"No saved records yet for {farm}.")
 
 # =========================================================================
-# SALES DETAILS — read-only from the Google Sheet's perspective (nothing
-# here ever writes back to the Sales Details spreadsheet), filtered to the
-# Customer Code belonging to the Customer + Farm selected above. Shown as
-# individual sales line items with a per-row "Delete" checkbox — checking
-# it just hides that row from THIS view (and from the totals below) for
-# the current session; it never touches the Google Sheet, so a refresh or
-# a new session brings the row right back.
+# SALES DETAILS — read-only, straight from the Sales Details Google Sheet,
+# filtered to the Customer Code belonging to the Customer + Farm selected
+# above. VIEW-ONLY: there is no delete/recycle-bin control here — a date
+# already marked Settle = 'Yes' in the Sheet (e.g. by the full manager
+# app) stays excluded, but nothing on this page can set that flag itself.
 # =========================================================================
 st.markdown("---")
 st.markdown(f"#### 🧾 Sales Details — {farm}")
@@ -847,39 +845,19 @@ if df_sales is not None:
             pivot_display = pivot_display[
                 ~pivot_display["Date"].map(_settled_by_date).fillna(False)
             ].reset_index(drop=True)
-            sales_editor_key = f"sales_delete_editor_{selected_customer_code}"
 
-            st.caption(
-                "🗑️ Select a row's checkbox (left edge) then click the recycle-bin icon "
-                "above the table to remove that date — this writes 'Yes' to the Settle "
-                "column in the Google Sheet, so it stays removed after a refresh."
-            )
-            edited_pivot = st.data_editor(
+            # VIEW-ONLY: no recycle-bin / delete control here — Technical
+            # Officers & Marketing Managers can only view these sales line
+            # items, never remove one. A date already marked Settle = 'Yes'
+            # in the Sheet (e.g. by the full manager app) is still excluded
+            # above, but nothing on this page can set that flag itself.
+            st.dataframe(
                 pivot_display,
                 use_container_width=True,
                 hide_index=True,
-                key=sales_editor_key,
-                num_rows="dynamic",
-                disabled=list(pivot_display.columns),
             )
 
-            # A date missing from edited_pivot was just removed via the
-            # recycle bin — mark every one of that date's line items as
-            # Settle = 'Yes' in the Sheet so the removal persists.
-            removed_dates = set(pivot_display["Date"]) - set(edited_pivot["Date"].dropna())
-            if removed_dates:
-                sales_ws = get_sales_worksheet()
-                settle_col_idx = get_or_create_column(sales_ws, "Settle")
-                for _removed_date in removed_dates:
-                    _rows_for_date = df_sales_farm[df_sales_farm["Date"] == _removed_date]
-                    for _, _r in _rows_for_date.iterrows():
-                        _current_settle = str(_r.get("Settle", "")).strip().lower()
-                        if _current_settle != "yes":
-                            sales_ws.update_cell(int(_r["_RowNumber"]), settle_col_idx, "Yes")
-                st.rerun()
-
-            kept_dates = edited_pivot["Date"].dropna()
-            _num_hidden = len(pivot_display) - len(kept_dates)
+            kept_dates = pivot_display["Date"].dropna()
 
             df_sales_farm_visible = df_sales_farm[df_sales_farm["Date"].isin(kept_dates)]
 
@@ -887,8 +865,6 @@ if df_sales is not None:
                 f"{len(df_sales_farm_visible)} sales line item(s) across "
                 f"{len(kept_dates)} date(s) for Customer Code '{selected_customer_code}'."
             )
-            if _num_hidden:
-                _caption += f" ({_num_hidden} row(s) hidden in this view.)"
             st.caption(_caption)
 
             # Total Quantity / Total Sales Amt reflect FEED items only —
