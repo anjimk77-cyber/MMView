@@ -635,13 +635,13 @@ if len(df_farm_summary) > 0:
             # app's Pond Layout).
             _wq_special_val = str(_prow.get("WQ Special Cases", "")).strip()
             _wq_special_icon_html = (
-                "<div style='position:absolute;top:2px;right:4px;font-size:1rem;line-height:1;' "
+                "<div style='position:absolute;top:2px;right:4px;font-size:1.3rem;line-height:1;' "
                 "title='WQ Special Case'>🫨</div>"
                 if _wq_special_val else ""
             )
             _wq_special_text_html = (
-                f"<div style='font-size:0.7rem;color:#b45309;text-align:center;"
-                f"max-width:170px;margin-top:2px;'>🫨 {_escape_html_pond(_wq_special_val)}</div>"
+                f"<div style='font-size:0.85rem;color:#b45309;text-align:center;"
+                f"max-width:190px;margin-top:2px;'>🫨 {_escape_html_pond(_wq_special_val)}</div>"
                 if _wq_special_val else ""
             )
 
