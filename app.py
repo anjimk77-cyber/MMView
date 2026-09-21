@@ -346,6 +346,9 @@ else:
 # the NANAMI/EGO feed "Do not exceed" limits.
 total_expect_harvest_kg = None
 total_density_by_species = {}
+# Same as total_density_by_species but INCLUDES Full H ponds. Used only
+# for the NANAMI / EGO feed "Do not exceed" limits in Sales Details.
+total_density_for_feed_limit_by_species = {}
 
 if len(df_farm_summary) > 0:
     if "Date" in df_farm_summary.columns:
@@ -396,6 +399,21 @@ if len(df_farm_summary) > 0:
                     _density_species_label = pd.Series("Unspecified", index=_density_pool.index)
                 total_density_by_species = (
                     _density_pool.groupby(_density_species_label)["Density"].sum().to_dict()
+                )
+
+            # ---- Feed-limit density: same idea, but Full H ponds are NOT excluded.
+            _feed_limit_pool = _latest_per_pond.copy()
+            _feed_limit_pool["Density"] = pd.to_numeric(_feed_limit_pool["Density"], errors="coerce")
+            _feed_limit_pool = _feed_limit_pool.dropna(subset=["Density"])
+            if len(_feed_limit_pool) > 0:
+                if "Species Culture" in _feed_limit_pool.columns:
+                    _feed_limit_species_label = (
+                        _feed_limit_pool["Species Culture"].astype(str).str.strip().replace("", "Unspecified")
+                    )
+                else:
+                    _feed_limit_species_label = pd.Series("Unspecified", index=_feed_limit_pool.index)
+                total_density_for_feed_limit_by_species = (
+                    _feed_limit_pool.groupby(_feed_limit_species_label)["Density"].sum().to_dict()
                 )
 
         sort_cols = [c for c in ["Pond Number"] if c in df_farm_summary.columns] + ["_ParsedDate"]
@@ -930,8 +948,10 @@ if df_sales is not None:
             # exceed" formula for each brand's sizes. Each size's limit =
             # factor * that farm's Total Density for the species the brand
             # is fed to — NANAMI uses Vannamei Ponds Total Density, EGO
-            # uses Monodon Ponds Total Density (both computed in "All Saved
-            # Records" above).
+            # uses Monodon Ponds Total Density. These feed-limit densities
+            # come from total_density_for_feed_limit_by_species (computed in
+            # "All Saved Records" above), which INCLUDES ponds at Full
+            # Harvest, unlike the displayed "Ponds Total Density" lines.
             # =================================================================
             NANAMI_FEED_ORDER = [
                 "NANAMI 1", "NANAMI 1S", "NANAMI 2S", "NANAMI 3S",
@@ -958,14 +978,16 @@ if df_sales is not None:
                 "EGO - 03L": 750 / 100000, "EGO - 04L": 1000 / 100000
             }
 
-            # The Vannamei / Monodon entries from total_density_by_species
-            # (computed in the "All Saved Records" section above, for this
-            # same Customer + Farm). Matched case-insensitively since the
-            # exact text comes from whatever the Species Culture column
-            # contains (e.g. "Vannamei", "L. vannamei", "Monodon", etc.).
+            # The Vannamei / Monodon entries from
+            # total_density_for_feed_limit_by_species (computed in the
+            # "All Saved Records" section above, for this same Customer +
+            # Farm, INCLUDING Full H ponds). Matched case-insensitively
+            # since the exact text comes from whatever the Species Culture
+            # column contains (e.g. "Vannamei", "L. vannamei", "Monodon",
+            # etc.).
             _vannamei_total_density = 0.0
             _monodon_total_density = 0.0
-            for _density_species_key, _density_species_val in total_density_by_species.items():
+            for _density_species_key, _density_species_val in total_density_for_feed_limit_by_species.items():
                 _density_key_lower = str(_density_species_key).lower()
                 if "vannamei" in _density_key_lower:
                     _vannamei_total_density = _density_species_val
