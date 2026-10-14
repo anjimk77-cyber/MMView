@@ -35,6 +35,9 @@ from google.oauth2.service_account import Credentials
 #      customers/farms/ponds.
 #   5) "🗓️ Last Visit Date Report" — every Customer + Farm's Status
 #      (Running / FULL H), latest data-entry date and days since.
+#   6) "💬 Ask Farm Data" — type a question (zone / farm / species /
+#      status / DOC range) and get a count + list straight from the Sheet.
+#      No API key, no AI service.
 #
 # Deploy this file as its own Streamlit app (its own URL/link) so the
 # marketing manager gets a separate link from the data-entry app and the
@@ -1507,6 +1510,270 @@ if len(df_all_for_last_visit) > 0 and _last_visit_required.issubset(df_all_for_l
         st.caption("No Zone information found on the customer list — showing unfiltered.")
 else:
     st.info("No records available yet to build the last visit date report.")
+
+# =========================================================================
+# ASK FARM DATA — NEW SECTION. Type a question, get an answer + list,
+# straight from the Google Sheet. NO API key, NO AI service, completely
+# free. It understands these things in a question (any wording / order):
+#   * Zone            e.g. "Chilaw"
+#   * Customer / Farm e.g. "Ann Farm"
+#   * Species         e.g. "Vannamei", "Monodon"
+#   * Status          active / running, partial, full H, soon to be
+#   * DOC             "DOC 30-60", "DOC above 60", "DOC below 30"
+#   * Issues          "issue", "disease", "problem"
+# Pond rules are the same as the Pond Layout / Last Visit sections (latest
+# record per pond, Partial H sticks, DOC Today, Full H stops DOC counting).
+# Entirely read-only — nothing is written to either Google Sheet.
+# =========================================================================
+st.markdown("---")
+st.markdown("#### 💬 Ask Farm Data")
+st.caption(
+    "Type a question about your farms — no API key needed, it reads the Google Sheet directly. "
+    "It understands Zone, Customer/Farm name, Species, status (active, Partial H, Full H, soon to be), "
+    "DOC ranges and Issues."
+)
+st.caption(
+    "Examples:  What is the new situation of Ann Farm?  |  How many ponds active in Chilaw zone?  |  "
+    "List Vannamei ponds DOC 30-60  |  Monodon ponds in Chilaw DOC above 90  |  Ponds with issues in Chilaw"
+)
+
+_qa_df = load_data()
+_qa_required = {"Customer", "Farm Name with Code", "Pond Number", "Date", "DOC", "Species Culture",
+                "Harvest Type", "Harvest Type 2"}
+if len(_qa_df) == 0 or not _qa_required.issubset(_qa_df.columns):
+    st.info("No records available yet to answer questions.")
+else:
+    _qa_df = _qa_df.copy()
+    _qa_df["_ParsedDate"] = pd.to_datetime(_qa_df["Date"], errors="coerce")
+    _qa_pk = ["Customer", "Farm Name with Code", "Pond Number"]
+
+    _qa_ponds = (
+        _qa_df.dropna(subset=["_ParsedDate"]).sort_values("_ParsedDate")
+        .groupby(_qa_pk, as_index=False).last()
+    )
+    _qa_hist = (
+        _qa_df.assign(
+            _P=(_qa_df["Harvest Type"].astype(str).str.lower().str.contains("partial")
+                | _qa_df["Harvest Type 2"].astype(str).str.lower().str.contains("partial"))
+        ).groupby(_qa_pk)["_P"].any()
+    )
+
+    def _qa_status(p):
+        _h = (str(p.get("Harvest Type 2", "")).strip() or str(p.get("Harvest Type", "")).strip()).lower()
+        _key = (p["Customer"], p["Farm Name with Code"], p["Pond Number"])
+        if "full" in _h:
+            return "Full H"
+        if "partial" in _h or bool(_qa_hist.get(_key, False)):
+            return "Partial H"
+        if str(p.get("Cycle Type", "")).strip() == "Soon to be":
+            return "Soon to be"
+        return "Running"
+
+    def _qa_doc_today(p):
+        if str(p.get("Cycle Type") or "").strip() == "Soon to be":
+            return 0.0
+        _d = pd.to_datetime(p.get("Date"), errors="coerce")
+        if pd.isna(_d):
+            return float("nan")
+        try:
+            _doc = int(float(p.get("DOC")))
+        except (TypeError, ValueError):
+            return float("nan")
+        _t2 = str(p.get("Harvest Type 2", "")).strip().lower()
+        _t1 = str(p.get("Harvest Type", "")).strip().lower()
+        _full_str = ""
+        if "full" in _t2:
+            _full_str = str(p.get("Harvest Date 2", "")).strip()
+        elif "full" in _t1:
+            _full_str = str(p.get("Harvest Date", "")).strip()
+        if _full_str:
+            _fd = pd.to_datetime(_full_str, errors="coerce")
+            if pd.notna(_fd):
+                return float(_doc + (_fd - _d).days)
+        return float(_doc + (pd.Timestamp(date.today()) - _d).days)
+
+    _qa_ponds["Status"] = _qa_ponds.apply(_qa_status, axis=1)
+    _qa_ponds["_DOCToday"] = _qa_ponds.apply(_qa_doc_today, axis=1)
+    _qa_zone_lookup = customer_df[["Customer Name", "Farm Name with Code", "Zone"]].drop_duplicates(
+        subset=["Customer Name", "Farm Name with Code"]
+    ).rename(columns={"Customer Name": "Customer"})
+    # The sheet rows already carry their own "Zone" column, so it is renamed
+    # first to avoid a Zone_x / Zone_y clash; the Customer List zone wins and
+    # the sheet's own Zone is only used when the list has none for that farm.
+    _qa_ponds = _qa_ponds.rename(columns={"Zone": "_SheetZone"})
+    _qa_ponds = _qa_ponds.merge(_qa_zone_lookup, on=["Customer", "Farm Name with Code"], how="left")
+    _qa_ponds["Zone"] = _qa_ponds["Zone"].fillna("").astype(str).str.strip()
+    _qa_ponds.loc[_qa_ponds["Zone"].isin(["", "nan"]), "Zone"] = (
+        _qa_ponds["_SheetZone"].fillna("").astype(str).str.strip()
+    )
+    _qa_ponds["Species"] = _qa_ponds["Species Culture"].astype(str).str.strip()
+
+    _qa_zones = sorted({z for z in _qa_ponds["Zone"].tolist() if z and z.lower() != "nan"})
+    _qa_customers = sorted(_qa_ponds["Customer"].astype(str).unique().tolist())
+    _qa_farms = sorted(_qa_ponds["Farm Name with Code"].astype(str).unique().tolist())
+    _QA_STOP = {"farm", "farms", "pvt", "ltd", "the", "and", "aqua", "company", "zone"}
+
+    def _qa_name_toks(s):
+        return {t for t in re.findall(r"[a-z]+", str(s).lower()) if len(t) >= 3} - _QA_STOP
+
+    def _qa_answer(question):
+        ql = question.lower()
+        qtoks = set(re.findall(r"[a-z0-9]+", ql))
+        res = _qa_ponds.copy()
+        applied = []
+
+        # ---- Zone
+        zone_hits = []
+        for z in _qa_zones:
+            zt = set(re.findall(r"[a-z0-9]+", z.lower())) - {"zone"}
+            if zt and zt <= qtoks:
+                zone_hits.append(z)
+        if not zone_hits:
+            for z in _qa_zones:
+                zt = {t for t in re.findall(r"[a-z]+", z.lower()) if len(t) >= 4} - {"zone"}
+                if zt & qtoks:
+                    zone_hits.append(z)
+        if zone_hits:
+            res = res[res["Zone"].isin(zone_hits)]
+            applied.append("Zone: " + ", ".join(zone_hits))
+        zone_tok_pool = set()
+        for z in zone_hits:
+            zone_tok_pool |= set(re.findall(r"[a-z0-9]+", z.lower()))
+
+        # ---- Customer / Farm name
+        cust_hits, farm_hits = [], []
+        for c in _qa_customers:
+            t = _qa_name_toks(c)
+            if t and t <= qtoks and not t <= zone_tok_pool:
+                cust_hits.append(c)
+        for f in _qa_farms:
+            t = _qa_name_toks(f)
+            if t and t <= qtoks and not t <= zone_tok_pool:
+                farm_hits.append(f)
+        farm_asked = bool(cust_hits or farm_hits)
+        if farm_asked:
+            res = res[res["Customer"].isin(cust_hits) | res["Farm Name with Code"].isin(farm_hits)]
+            applied.append("Customer/Farm: " + ", ".join(cust_hits + farm_hits))
+
+        # ---- Species
+        if re.search(r"\bvan\w*", ql):
+            res = res[res["Species"].str.lower().str.contains("vannamei")]
+            applied.append("Species: Vannamei")
+        elif re.search(r"\bmon\w*", ql):
+            res = res[res["Species"].str.lower().str.contains("monodon")]
+            applied.append("Species: Monodon")
+
+        # ---- DOC range (uses DOC Today)
+        doc_filter = False
+        if "doc" in qtoks or re.search(r"\bdays?\b", ql):
+            m = re.search(r"(\d+)\s*(?:-|–|to|and)\s*(\d+)", ql)
+            m_hi = re.search(r"(?:above|over|more than|greater than|older than|>)\s*(\d+)", ql)
+            m_lo = re.search(r"(?:below|under|less than|younger than|<)\s*(\d+)", ql)
+            if m:
+                lo, hi = sorted([int(m.group(1)), int(m.group(2))])
+                res = res[(res["_DOCToday"] >= lo) & (res["_DOCToday"] <= hi)]
+                applied.append(f"DOC Today: {lo}-{hi}")
+                doc_filter = True
+            elif m_hi:
+                res = res[res["_DOCToday"] > int(m_hi.group(1))]
+                applied.append(f"DOC Today: above {m_hi.group(1)}")
+                doc_filter = True
+            elif m_lo:
+                res = res[res["_DOCToday"] < int(m_lo.group(1))]
+                applied.append(f"DOC Today: below {m_lo.group(1)}")
+                doc_filter = True
+
+        # ---- Status
+        status_sel = None
+        if re.search(r"\bpartial", ql):
+            status_sel = ["Partial H"]
+        elif re.search(r"\bfull\b|fully|\bharvested\b|\bfinished\b|\bcompleted\b", ql):
+            status_sel = ["Full H"]
+        elif re.search(r"\bsoon\b|not started|yet to start", ql):
+            status_sel = ["Soon to be"]
+        elif re.search(r"\bactive\b|\brunning\b|\bongoing\b|\bcurrent\w*|\bnow\b", ql):
+            status_sel = ["Running", "Partial H"]
+        elif doc_filter:
+            status_sel = ["Running", "Partial H"]   # a DOC range only makes sense for live ponds
+        if status_sel:
+            res = res[res["Status"].isin(status_sel)]
+            applied.append("Status: " + " + ".join(status_sel)
+                           + (" (active)" if status_sel == ["Running", "Partial H"] else ""))
+
+        # ---- Issues
+        if re.search(r"\bissues?\b|disease|problem", ql):
+            res = res[res["Issues"].astype(str).str.strip().ne("")]
+            applied.append("Has Issues")
+
+        if not applied:
+            return (
+                "I couldn't find a **zone, farm name, species, status or DOC range** in that question. "
+                "Try for example:\n\n"
+                "- *What is the new situation of Ann Farm?*\n"
+                "- *How many ponds active in Chilaw zone?*\n"
+                "- *List Vannamei ponds DOC 30-60*",
+                None,
+            )
+
+        res = res.sort_values(by=["Zone", "Customer", "Farm Name with Code", "Pond Number"])
+        n_ponds = len(res)
+        n_farms = res[["Customer", "Farm Name with Code"]].drop_duplicates().shape[0]
+        lines = [f"**{n_ponds} pond(s)** across **{n_farms} farm(s)** match.",
+                 "Filters understood: " + "  ·  ".join(applied)]
+        if n_ponds:
+            lines.append("By status: " + ", ".join(f"{k}: {v}" for k, v in res["Status"].value_counts().items()))
+            if res["Species"].replace("", pd.NA).dropna().nunique() > 1:
+                lines.append("By species: " + ", ".join(
+                    f"{k}: {v}" for k, v in res["Species"].replace("", "Unspecified").value_counts().items()))
+        if farm_asked and n_ponds:
+            _open = res[res["Status"] != "Full H"]
+            _exp = pd.to_numeric(_open["Expect Harvest (KG)"], errors="coerce").sum()
+            lines.append(f"Total expecting harvest (ponds not at Full H): **{_exp:,.2f} kg**")
+            _visit = _qa_df[
+                _qa_df["Customer"].isin(cust_hits) | _qa_df["Farm Name with Code"].isin(farm_hits)
+            ]["_ParsedDate"].max()
+            if pd.notna(_visit):
+                lines.append(f"Last data entry: **{_visit.strftime('%Y-%m-%d')}** "
+                             f"({(pd.Timestamp(date.today()) - _visit).days} day(s) ago)")
+
+        show = res.copy()
+        show["DOC Today"] = show["_DOCToday"].apply(lambda v: "" if pd.isna(v) else str(int(v)))
+        show["Last Visit"] = show["Date"]
+        show = show.rename(columns={"Farm Name with Code": "Farm", "Pond Number": "Pond"})
+        cols = ["Zone", "Customer", "Farm", "Pond", "Species", "Status", "DOC Today", "Density",
+                "ABW", "Feed Per Day", "Expect Harvest (KG)", "Issues", "Grade", "Last Visit"]
+        show = show[[c for c in cols if c in show.columns]]
+        return "\n\n".join(lines), (show if n_ponds else None)
+
+    if "qa_history" not in st.session_state:
+        st.session_state["qa_history"] = []
+
+    # Inline question box (a form, so the page does not re-run on every keystroke).
+    with st.form("qa_form", clear_on_submit=True):
+        _qa_question = st.text_input(
+            "Your question", placeholder="e.g. How many Vannamei ponds are in DOC 30-60?", key="qa_question_input"
+        )
+        _qa_submit = st.form_submit_button("Ask")
+
+    if _qa_submit and _qa_question.strip():
+        try:
+            _qa_text, _qa_table = _qa_answer(_qa_question)
+        except Exception as e:
+            _qa_text, _qa_table = f"❌ Sorry, I could not answer that.\n\n{e}", None
+        # newest answer first
+        st.session_state["qa_history"].insert(0, {"q": _qa_question, "text": _qa_text, "df": _qa_table})
+
+    if st.session_state["qa_history"]:
+        if st.button("🗑️ Clear answers", key="qa_clear_history"):
+            st.session_state["qa_history"] = []
+            st.rerun()
+        for _qa_item in st.session_state["qa_history"]:
+            with st.chat_message("user"):
+                st.markdown(_qa_item["q"])
+            with st.chat_message("assistant"):
+                st.markdown(_qa_item["text"])
+                if _qa_item.get("df") is not None:
+                    st.dataframe(_qa_item["df"], use_container_width=True, hide_index=True)
 
 st.markdown("---")
 st.markdown(
