@@ -26,8 +26,10 @@ from google.oauth2.service_account import Credentials
 # as removed/settled by the full manager app (Settle = 'Yes', or Harvest
 # Status = 'H') stays hidden here too, but nothing on this page can set
 # either flag itself. Everything here is read-only:
-#   0) "🤖 KMN AI Chatbot" (SIDEBAR) — ask questions about customers,
-#      farms, ponds, harvests and DOC; answers come live from the Sheet.
+#   0) "🤖 KMN AI Chatbot" (SIDEBAR option) — switch it on in the sidebar
+#      to ask questions about customers, farms, ponds, harvests and DOC;
+#      answers come live from the Sheet. Asking about a farm shows that
+#      farm's Pond Layout.
 #   1) "📋 Enter Customer Details" — Customer / Farm selection (used only
 #      to choose which farm's records to view)
 #   2) "📊 All Saved Records" + "🟦 Pond Layout" — a live, read-only view
@@ -277,13 +279,17 @@ for _col in REQUIRED_COLS:
 all_customers = sorted(customer_df["Customer Name"].replace("", pd.NA).dropna().unique().tolist())
 
 # =========================================================================
-# 🤖 KMN AI CHATBOT (SIDEBAR) — NEW SECTION
+# 🤖 KMN AI CHATBOT (SIDEBAR OPTION) — NEW SECTION
 #
-# Read-only Q&A over the same Google Sheet + Customer List already loaded
-# above. Rule-based (no API key needed). It answers questions such as:
+# The sidebar shows an option "🤖 KMN AI Chatbot". Switch it on and the
+# chatbot appears; switch it off and it is hidden again. Read-only Q&A over
+# the same Google Sheet + Customer List already loaded above (rule-based,
+# no API key needed). Short answers only:
 #   * Who are the customers with Full H or Partial H ponds from 2026-10-01?
 #     Give me Zone wise Customer List.
-#   * What is the new situation of Ann Farm?
+#   * What is the new situation of Ann Farm?   -> short summary + that
+#     farm's Pond Layout (same boxes as the Pond Layout section below,
+#     including Full H ponds).
 #   * How many ponds active in Chilaw zone?
 #   * How many Vannamei ponds are in range DOC 30-60? Give me list.
 # Nothing in this block writes to either Google Sheet, and it does not
@@ -291,6 +297,7 @@ all_customers = sorted(customer_df["Customer Name"].replace("", pd.NA).dropna().
 # =========================================================================
 _CHAT_HISTORY_KEY = "kmn_chat_history"
 _CHAT_PENDING_KEY = "kmn_chat_pending"
+_CHAT_OPEN_KEY = "kmn_chat_open"
 
 _CHAT_EXAMPLES = [
     "Who are the Customers having Full H or Partial H Ponds from 2026-10-01? Give me Zone wise Customer List.",
@@ -299,10 +306,13 @@ _CHAT_EXAMPLES = [
     "How many Vannamei Ponds are in range DOC 30-60? Give me list",
 ]
 
+# Only injected while the chatbot option is switched on (so the sidebar
+# stays normal-width when the chatbot is hidden). Wide enough for two
+# Pond Layout cards side by side.
 _CHAT_SIDEBAR_CSS = """
 <style>
 @media (min-width: 701px) {
-    section[data-testid="stSidebar"] { min-width: 420px !important; max-width: 650px !important; }
+    section[data-testid="stSidebar"] { min-width: 540px !important; max-width: 700px !important; }
 }
 </style>
 """
@@ -313,15 +323,16 @@ _CHAT_Q_STOP = {
     "detail", "about", "tell", "show", "please", "info", "report", "of", "how", "many", "give", "me",
     "list", "in", "are", "ponds", "pond", "farm", "farms", "zone", "who", "customers", "customer",
     "with", "having", "from", "to", "and", "for", "all", "active", "running", "doc", "range",
+    "layout", "condition",
 }
 _CHAT_ACTIVE = ("Running", "Partial H")
 
 _CHAT_HELP = (
     "I can answer questions from your live Google Sheet data. Try:\n\n"
-    "- **Harvests:** *Customers with Full H or Partial H ponds from 2026-10-01, zone wise*\n"
-    "- **Farm status:** *What is the new situation of Ann Farm?*\n"
-    "- **Active ponds:** *How many ponds active in Chilaw zone?*\n"
-    "- **DOC range:** *How many Vannamei ponds are in range DOC 30-60? Give me list*"
+    "- *Customers with Full H or Partial H ponds from 2026-10-01, zone wise*\n"
+    "- *What is the new situation of Ann Farm?*\n"
+    "- *How many ponds active in Chilaw zone?*\n"
+    "- *How many Vannamei ponds are in range DOC 30-60? Give me list*"
 )
 
 _CHAT_DATE_RE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})")
@@ -332,6 +343,10 @@ def _chat_s(v):
         return ""
     t = str(v).strip()
     return "" if t.lower() == "nan" else t
+
+
+def _chat_esc(v):
+    return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _chat_parse_kg(raw):
@@ -382,6 +397,11 @@ def _chat_doc_today(row):
     return doc_num + (pd.Timestamp(date.today()) - parsed).days
 
 
+def _chat_doc_today_str(row):
+    v = _chat_doc_today(row)
+    return "" if v is None else str(v)
+
+
 def _chat_attach_zone(frame, cust_df):
     z = cust_df[["Customer Name", "Farm Name with Code", "Zone"]].drop_duplicates(
         subset=["Customer Name", "Farm Name with Code"]
@@ -402,7 +422,8 @@ def _chat_sort_ponds(frame):
 
 
 def _chat_build_ponds(df, cust_df):
-    """Latest saved record per Customer+Farm+Pond, with status / DOC Today."""
+    """Latest saved record per Customer+Farm+Pond, with status / DOC Today
+    (used for the count and DOC-range answers)."""
     if df is None or len(df) == 0:
         return pd.DataFrame()
     key = ["Customer", "Farm Name with Code", "Pond Number"]
@@ -416,16 +437,7 @@ def _chat_build_ponds(df, cust_df):
         d["Harvest Type"].astype(str).str.lower().str.contains("partial")
         | d["Harvest Type 2"].astype(str).str.lower().str.contains("partial")
     )
-    d["_k"] = d.apply(_chat_harvest_kg_row, axis=1)
     partial_by = d.groupby(key)["_p"].any().to_dict()
-    kg_by = d.groupby(key)["_k"].sum().to_dict()
-
-    notes_by = {}
-    if "Notes" in d.columns:
-        ns = d[d["Notes"].astype(str).str.strip() != ""].sort_values("_dt", kind="mergesort")
-        if len(ns) > 0:
-            notes_by = ns.groupby(key)["Notes"].last().astype(str).str.strip().to_dict()
-
     latest = d.sort_values("_dt", kind="mergesort").groupby(key, as_index=False).last()
 
     recs = []
@@ -440,15 +452,6 @@ def _chat_build_ponds(df, cust_df):
             status = "Soon to be"
         else:
             status = "Running"
-
-        density = pd.to_numeric(r.get("Density"), errors="coerce")
-        surv = pd.to_numeric(r.get("Survival QTY"), errors="coerce")
-        surv_txt = (
-            f"{(surv / density) * 100:,.1f}%"
-            if pd.notna(density) and density > 0 and pd.notna(surv) else ""
-        )
-        expect = pd.to_numeric(r.get("Expect Harvest (KG)"), errors="coerce")
-
         recs.append({
             "Customer": r["Customer"],
             "Farm": r["Farm Name with Code"],
@@ -456,16 +459,6 @@ def _chat_build_ponds(df, cust_df):
             "Species": _chat_s(r.get("Species Culture")),
             "Status": status,
             "DOC Today": _chat_doc_today(r),
-            "Density": density,
-            "ABW": _chat_s(r.get("ABW")),
-            "Feed/Day": _chat_s(r.get("Feed Per Day")),
-            "Expect Harvest (KG)": expect,
-            "Survival Rate": surv_txt,
-            "Issues": _chat_s(r.get("Issues")),
-            "WQ Special Cases": _chat_s(r.get("WQ Special Cases")),
-            "Notes": notes_by.get(k, ""),
-            "Last Visit": r["_dt"],
-            "Total Harvest KG": kg_by.get(k, 0.0),
         })
     ponds = pd.DataFrame(recs)
     return _chat_sort_ponds(_chat_attach_zone(ponds, cust_df))
@@ -476,12 +469,12 @@ def _chat_build_harvest_events(df, cust_df):
     if df is None or len(df) == 0:
         return pd.DataFrame()
     slots = [
-        ("Harvest Date", "Harvest Type", "Harvest KG", "Harvest ABW", "Harvest Status"),
-        ("Harvest Date 2", "Harvest Type 2", "Harvest KG 2", "Harvest ABW 2", "Harvest Status 2"),
+        ("Harvest Date", "Harvest Type", "Harvest Status"),
+        ("Harvest Date 2", "Harvest Type 2", "Harvest Status 2"),
     ]
     rows = []
     for _, r in df.iterrows():
-        for dcol, tcol, kcol, acol, scol in slots:
+        for dcol, tcol, scol in slots:
             htype = _chat_s(r.get(tcol))
             if not htype or _chat_s(r.get(scol)).upper() == "H":
                 continue
@@ -498,8 +491,6 @@ def _chat_build_harvest_events(df, cust_df):
                 "Pond": _chat_s(r.get("Pond Number")),
                 "Harvest Type": kind,
                 "Harvest Date": hd.strftime("%Y-%m-%d"),
-                "Harvest KG": _chat_s(r.get(kcol)),
-                "Harvest ABW": _chat_s(r.get(acol)),
                 "_hd": hd,
             })
     if not rows:
@@ -544,7 +535,7 @@ def _chat_date_window(q):
     elif end is not None:
         label = f"up to {end:%Y-%m-%d}"
     else:
-        label = "(all dates)"
+        label = ""
     return start, end, label
 
 
@@ -646,6 +637,279 @@ def _chat_apply_scope(frame, zones_found, farm_hit):
     return frame, "all zones"
 
 
+# -------------------------------------------------------------------------
+# POND LAYOUT for the chatbot — a self-contained copy of the Pond Layout
+# card logic used by the "🟦 Pond Layout" section further down the page
+# (same colors, same Full H / Partial H / Soon to be / Running rules, same
+# "2nd harvest slot wins" and combined-harvest-KG parsing), so a farm asked
+# about in the chat looks exactly like the Pond Layout on the page, Full H
+# ponds included. Takes that farm's raw rows from load_data() and returns
+# (html, status_counts, latest_date).
+# -------------------------------------------------------------------------
+def _chat_pond_layout(farm_df):
+    df = farm_df.copy()
+    df["DOC Today"] = df.apply(_chat_doc_today_str, axis=1)
+
+    pond_latest = (
+        df.assign(_PondSortDate=pd.to_datetime(df["Date"], errors="coerce"))
+        .dropna(subset=["_PondSortDate"])
+        .sort_values("_PondSortDate")
+        .groupby("Pond Number", as_index=False)
+        .last()
+        .sort_values("Pond Number")
+    )
+    if pond_latest.empty:
+        return "", {}, None
+
+    partial_history_by_pond = (
+        df.assign(
+            _HasPartial=(
+                df["Harvest Type"].astype(str).str.lower().str.contains("partial")
+                | df["Harvest Type 2"].astype(str).str.lower().str.contains("partial")
+            )
+        )
+        .groupby("Pond Number")["_HasPartial"]
+        .any()
+    )
+
+    latest_notes_by_pond = {}
+    notes_src = df.assign(_NotesSortDate=pd.to_datetime(df["Date"], errors="coerce"))
+    notes_src = notes_src[notes_src["Notes"].astype(str).str.strip().replace("nan", "") != ""]
+    if len(notes_src) > 0:
+        notes_src = notes_src.sort_values("_NotesSortDate", kind="mergesort", na_position="first")
+        latest_notes_by_pond = notes_src.groupby("Pond Number")["Notes"].last().astype(str).str.strip().to_dict()
+
+    total_harvest_kg_by_pond = (
+        df.assign(_HarvestKGRow=df.apply(_chat_harvest_kg_row, axis=1))
+        .groupby("Pond Number")["_HarvestKGRow"]
+        .sum()
+    )
+
+    def harvest_type(prow):
+        return str(prow.get("Harvest Type 2", "")).strip() or str(prow.get("Harvest Type", "")).strip()
+
+    def pond_status(prow):
+        h_type_lower = harvest_type(prow).lower()
+        has_partial_history = bool(partial_history_by_pond.get(prow.get("Pond Number", ""), False))
+        if "full" in h_type_lower:
+            return "Full H"
+        elif "partial" in h_type_lower or has_partial_history:
+            return "Partial H"
+        elif str(prow.get("Cycle Type", "")).strip() == "Soon to be":
+            return "Soon to be"
+        else:
+            return "Running"
+
+    box_colors = {"Partial H": "#fff3cd", "Full H": "#d4edda", "Soon to be": "#e2e2e2", "Running": "#eaf4ff"}
+
+    def species_letter(prow):
+        sp = str(prow.get("Species Culture", "")).strip().lower()
+        if "vannamei" in sp:
+            return "V"
+        elif "monodon" in sp:
+            return "M"
+        return ""
+
+    status_counts = {}
+    boxes_html = ""
+    for _, prow in pond_latest.iterrows():
+        pond_no = _chat_esc(prow.get("Pond Number", ""))
+        status_box = pond_status(prow)
+        box_color = box_colors[status_box]
+        status_counts[status_box] = status_counts.get(status_box, 0) + 1
+
+        notes_val = str(latest_notes_by_pond.get(prow.get("Pond Number", ""), "")).strip()
+        notes_html = (
+            "<div style='width:210px;box-sizing:border-box;margin-bottom:4px;padding:4px 6px;"
+            "background:#fffbe6;border:1px solid #e6c200;border-radius:6px;font-size:0.8rem;"
+            "color:#333;text-align:left;line-height:1.3;word-break:break-word;'>"
+            f"{_chat_esc(notes_val)}</div>"
+            if notes_val and notes_val.lower() != "nan" else ""
+        )
+
+        wq_special_val = str(prow.get("WQ Special Cases", "")).strip()
+        wq_special_icon_html = (
+            "<div style='position:absolute;top:2px;right:4px;font-size:1.3rem;line-height:1;' "
+            "title='WQ Special Case'>🫨</div>"
+            if wq_special_val else ""
+        )
+        wq_special_text_html = (
+            f"<div style='font-size:0.85rem;color:#b45309;text-align:center;"
+            f"max-width:190px;margin-top:2px;'>🫨 {_chat_esc(wq_special_val)}</div>"
+            if wq_special_val else ""
+        )
+
+        density_val = pd.to_numeric(prow.get("Density", ""), errors="coerce")
+        density_str = f"{density_val:,.0f}" if pd.notna(density_val) else "-"
+        lvd_str = _chat_esc(str(prow.get("Date", "")).strip() or "-")
+        feed_day_str = _chat_esc(prow.get("Feed Per Day", "") or "-")
+        abw_str = _chat_esc(prow.get("ABW", "") or "-")
+        extra_details_html = (
+            "<div style='font-size:0.85rem;color:#333;text-align:left;width:100%;"
+            "padding:0 8px;margin-top:4px;line-height:1.4;'>"
+            f"<div>Stocking Density - {density_str}</div>"
+            f"<div>L.V.D - {lvd_str}</div>"
+            f"<div>Feed/Day - {feed_day_str} &nbsp;|&nbsp; ABW - {abw_str}</div>"
+            "</div>"
+        )
+
+        issues_val = str(prow.get("Issues", "")).strip()
+        issues_html = (
+            "<div style='margin-top:auto;width:100%;text-align:center;font-size:0.85rem;"
+            "font-weight:bold;border-top:1px dashed #bbb;padding-top:3px;'>"
+            "<span style='color:#333;'></span>"
+            f"<span style='color:red;'>{_chat_esc(issues_val)}</span></div>"
+            if issues_val and issues_val.lower() != "nan" else ""
+        )
+
+        if status_box == "Full H":
+            h_date = str(prow.get("Harvest Date 2", "")).strip() or str(prow.get("Harvest Date", "")).strip()
+            h_date = _chat_esc(h_date or "-")
+            total_kg_box = total_harvest_kg_by_pond.get(prow.get("Pond Number", ""), 0)
+            total_kg_html = (
+                f"<div style='font-size:0.75rem;color:#333;'>Total: {total_kg_box:,.2f} KG</div>"
+                if total_kg_box else ""
+            )
+            box_middle_html = (
+                "<div style='font-size:1.2rem;font-weight:bold;color:red;'>Full H</div>"
+                f"<div style='font-size:0.75rem;color:#333;'>Harvest Date - {h_date}</div>"
+                f"{total_kg_html}"
+            )
+        elif status_box == "Soon to be":
+            box_middle_html = (
+                "<div style='font-size:1.1rem;font-weight:bold;color:#555;'>Soon to be</div>"
+            )
+        else:
+            if status_box == "Partial H":
+                total_kg_box = total_harvest_kg_by_pond.get(prow.get("Pond Number", ""), 0)
+                total_kg_html = (
+                    f"<div style='font-size:0.7rem;color:#333;'>Total: {total_kg_box:,.2f} KG</div>"
+                    if total_kg_box else ""
+                )
+            else:
+                total_kg_html = ""
+
+            doc_today_raw = prow.get("DOC Today", "")
+            doc_today_val = _chat_esc(doc_today_raw or "-")
+            try:
+                started_date = (
+                    pd.Timestamp(date.today()) - pd.Timedelta(days=int(float(doc_today_raw)))
+                ).strftime("%Y-%m-%d")
+            except (TypeError, ValueError):
+                started_date = None
+            started_label = f"Started on {started_date}" if started_date is not None else "Started on ---"
+            box_middle_html = (
+                f"<div style='font-size:1.4rem;font-weight:bold;color:red;'>{doc_today_val}</div>"
+                f"<div style='font-size:0.7rem;color:#777;'>{_chat_esc(started_label)}</div>"
+                f"{total_kg_html}"
+            )
+
+        if status_box == "Full H":
+            t2_expect = str(prow.get("Harvest Type 2", "")).strip().lower()
+            kg2_expect = _chat_parse_kg(prow.get("Harvest KG 2", ""))
+            kg1_expect = _chat_parse_kg(prow.get("Harvest KG", ""))
+            harvest_kg_val = kg2_expect if ("full" in t2_expect and pd.notna(kg2_expect)) else kg1_expect
+            expect_label = "Harvest Weight"
+            expect_val = f"{harvest_kg_val:,.2f} KG" if pd.notna(harvest_kg_val) else "-"
+        elif status_box == "Soon to be":
+            expect_label = "Expecting Harvest"
+            expect_val = "-"
+        else:
+            expect_label = "Expecting Harvest"
+            expect_kg = pd.to_numeric(prow.get("Expect Harvest (KG)", ""), errors="coerce")
+            expect_val = f"{expect_kg:,.2f} KG" if pd.notna(expect_kg) else "-"
+
+        expect_html = (
+            "<div style='font-size:0.85rem;color:#333;text-align:center;width:100%;margin-top:4px;"
+            "border-top:1px dashed #bbb;padding-top:3px;'>"
+            f"<b>{expect_label}:</b> {_chat_esc(expect_val)}</div>"
+        )
+
+        density_for_survival = pd.to_numeric(prow.get("Density", ""), errors="coerce")
+        survival_qty_val = pd.to_numeric(prow.get("Survival QTY", ""), errors="coerce")
+        if pd.notna(density_for_survival) and density_for_survival > 0 and pd.notna(survival_qty_val):
+            survival_rate_str = f"{(survival_qty_val / density_for_survival) * 100:,.2f}%"
+        else:
+            survival_rate_str = "-"
+        survival_rate_html = (
+            "<div style='font-size:0.85rem;color:#333;text-align:center;width:100%;margin-top:2px;'>"
+            f"<b>Survival Rate:</b> {_chat_esc(survival_rate_str)}</div>"
+        )
+
+        sp_label = species_letter(prow)
+        species_html = (
+            f"<div style='font-size:0.75rem;font-weight:bold;color:#444;margin-top:2px;'>{sp_label}</div>"
+            if sp_label else ""
+        )
+
+        boxes_html += (
+            "<div style='display:flex;flex-direction:column;align-items:center;margin:6px;'>"
+            f"{notes_html}"
+            f"<div style='position:relative;width:210px;min-height:175px;border:2px solid #333;"
+            "border-radius:6px;display:flex;flex-direction:column;align-items:center;"
+            f"justify-content:flex-start;padding:8px 0;background:{box_color};'>"
+            f"{wq_special_icon_html}"
+            f"<div style='font-size:0.8rem;color:#555;'>Pond {pond_no}</div>"
+            f"{box_middle_html}"
+            f"{expect_html}"
+            f"{survival_rate_html}"
+            f"{extra_details_html}"
+            f"{issues_html}"
+            "</div>"
+            f"{species_html}"
+            f"{wq_special_text_html}"
+            "</div>"
+        )
+
+    legend_html = (
+        "<div style='display:flex;gap:18px;justify-content:center;margin-bottom:8px;font-size:0.85rem;'>"
+        "<div><span style='display:inline-block;width:14px;height:14px;background:#eaf4ff;"
+        "border:1px solid #333;border-radius:3px;vertical-align:middle;margin-right:6px;'></span>Running</div>"
+        "<div><span style='display:inline-block;width:14px;height:14px;background:#fff3cd;"
+        "border:1px solid #333;border-radius:3px;vertical-align:middle;margin-right:6px;'></span>Partial H</div>"
+        "<div><span style='display:inline-block;width:14px;height:14px;background:#d4edda;"
+        "border:1px solid #333;border-radius:3px;vertical-align:middle;margin-right:6px;'></span>Full H</div>"
+        "</div>"
+    )
+    html = (
+        legend_html
+        + f"<div style='display:flex;flex-wrap:wrap;justify-content:center;'>{boxes_html}</div>"
+    )
+    return html, status_counts, pond_latest["_PondSortDate"].max()
+
+
+# -------------------------------------------------------------------------
+# Answers — all short. Each returns (markdown_text, optional_layout_html).
+# -------------------------------------------------------------------------
+def _chat_answer_farm(df, farm_hit):
+    kind, label = farm_hit
+    col = "Farm Name with Code" if kind == "farm" else "Customer"
+    sub = df[df[col] == label]
+    if sub.empty:
+        return f"No saved records yet for **{label}**.", None
+
+    today = pd.Timestamp(date.today())
+    summaries, layouts = [], ""
+    for (cust, farm), fdf in sub.groupby(["Customer", "Farm Name with Code"], sort=True):
+        html, cnt, last = _chat_pond_layout(fdf)
+        if not html:
+            continue
+        days = (today - last).days
+        summaries.append(
+            f"**{farm}** ({cust}) — {sum(cnt.values())} pond(s): "
+            f"Running {cnt.get('Running', 0)} · Partial H {cnt.get('Partial H', 0)} · "
+            f"Full H {cnt.get('Full H', 0)} · Soon to be {cnt.get('Soon to be', 0)}. "
+            f"Last data entry {last:%Y-%m-%d} ({days} day(s) ago)."
+        )
+        layouts += (
+            f"<div style='text-align:center;font-weight:bold;margin:6px 0;'>🟦 Pond Layout — {_chat_esc(farm)}</div>"
+            + html
+        )
+    if not summaries:
+        return f"No saved records yet for **{label}**.", None
+    return "\n\n".join(summaries), layouts
+
+
 def _chat_answer_harvest(q, df, cust_df, zones_found, farm_hit):
     ev = _chat_build_harvest_events(df, cust_df)
     if ev.empty:
@@ -668,29 +932,19 @@ def _chat_answer_harvest(q, df, cust_df, zones_found, farm_hit):
 
     ev, scope = _chat_apply_scope(ev, zones_found, farm_hit)
     kind_label = " / ".join(kinds)
+    when = f" {date_label}" if date_label else ""
     if ev.empty:
-        return f"No **{kind_label}** harvests found {date_label} for {scope}.", None
+        return f"No **{kind_label}** harvests found{when} in {scope}.", None
 
     ev = ev.sort_values(["Zone", "Customer", "Farm", "_hd"])
-    n_full = int((ev["Harvest Type"] == "Full H").sum())
-    n_part = int((ev["Harvest Type"] == "Partial H").sum())
-    lines = [
-        f"**{ev['Customer'].nunique()} customer(s)** · {ev[['Customer', 'Farm']].drop_duplicates().shape[0]} farm(s) · "
-        f"{len(ev)} harvest event(s) ({kind_label}) {date_label} — {scope}",
-        f"Full H: {n_full} · Partial H: {n_part}",
-        "",
-    ]
+    lines = [f"**{ev['Customer'].nunique()} customer(s)** with {kind_label} ponds{when} — {scope}", ""]
     for zone, zdf in ev.groupby("Zone", sort=True):
-        lines.append(f"**📍 {zone}** — {zdf['Customer'].nunique()} customer(s)")
+        lines.append(f"**📍 {zone}**")
         for (cust, farm), fdf in zdf.groupby(["Customer", "Farm"], sort=True):
-            parts = ", ".join(
-                f"P{r['Pond']} {r['Harvest Type']} ({r['_hd']:%m-%d})" for _, r in fdf.iterrows()
-            )
-            lines.append(f"- **{cust}** · {farm}: {parts}")
+            ponds_txt = ", ".join(f"P{r['Pond']} {r['Harvest Type']}" for _, r in fdf.iterrows())
+            lines.append(f"- {cust} · {farm}: {ponds_txt}")
         lines.append("")
-    table = ev[["Zone", "Customer", "Farm", "Pond", "Harvest Type", "Harvest Date",
-                "Harvest KG", "Harvest ABW"]].reset_index(drop=True)
-    return "\n".join(lines), table
+    return "\n".join(lines), None
 
 
 def _chat_answer_count(q, ponds, zones_found, farm_hit):
@@ -708,32 +962,14 @@ def _chat_answer_count(q, ponds, zones_found, farm_hit):
     active = sub[sub["Status"].isin(_CHAT_ACTIVE)]
     cnt = sub["Status"].value_counts().to_dict()
     lines = [
-        f"**{len(active)} active pond(s)** in {scope}{sp_txt}",
-        f"Running {cnt.get('Running', 0)} · Partial H {cnt.get('Partial H', 0)} "
-        f"(not counted: Full H {cnt.get('Full H', 0)}, Soon to be {cnt.get('Soon to be', 0)})",
+        f"**{len(active)} active pond(s)** in {scope}{sp_txt} "
+        f"(Running {cnt.get('Running', 0)} · Partial H {cnt.get('Partial H', 0)})"
     ]
-    if len(active) > 0:
-        by_sp = active["Species"].replace("", "Unspecified").value_counts()
-        lines.append("By species: " + " · ".join(f"{k} {v}" for k, v in by_sp.items()))
-
-    if zones_found or farm_hit:
-        tbl = (
-            active.groupby(["Zone", "Customer", "Farm"])
-            .agg(**{"Active Ponds": ("Pond", "count"),
-                    "Pond Numbers": ("Pond", lambda s: ", ".join(map(str, s)))})
-            .reset_index()
-        )
-    else:
+    if not (zones_found or farm_hit):
         lines.append("")
-        z = sub.groupby("Zone")["Status"].value_counts().unstack(fill_value=0)
-        for c in ["Running", "Partial H", "Full H", "Soon to be"]:
-            if c not in z.columns:
-                z[c] = 0
-        z["Active"] = z["Running"] + z["Partial H"]
-        tbl = z[["Active", "Running", "Partial H", "Full H", "Soon to be"]].reset_index()
-        for _, r in tbl.iterrows():
-            lines.append(f"- **{r['Zone']}**: {int(r['Active'])} active")
-    return "\n".join(lines), tbl
+        for zone, g in sub.groupby("Zone", sort=True):
+            lines.append(f"- {zone}: {int(g['Status'].isin(_CHAT_ACTIVE).sum())}")
+    return "\n".join(lines), None
 
 
 def _chat_answer_doc_range(q, ponds, zones_found, farm_hit, bounds):
@@ -758,82 +994,18 @@ def _chat_answer_doc_range(q, ponds, zones_found, farm_hit, bounds):
     if sub.empty:
         return f"No active {sp_txt} with DOC {rng} in {scope}.", None
 
-    lines = [f"**{len(sub)} {sp_txt}** with DOC Today {rng} — {scope}", ""]
+    lines = [f"**{len(sub)} {sp_txt}** with DOC {rng} — {scope}", ""]
     for zone, zdf in sub.groupby("Zone", sort=True):
-        lines.append(f"**📍 {zone}** — {len(zdf)} pond(s)")
+        lines.append(f"**📍 {zone}**")
         for (cust, farm), fdf in zdf.groupby(["Customer", "Farm"], sort=True):
-            parts = ", ".join(f"P{r['Pond']} (DOC {int(r['DOC Today'])})" for _, r in fdf.iterrows())
-            lines.append(f"- **{cust}** · {farm}: {parts}")
+            parts = ", ".join(f"P{r['Pond']} ({int(r['DOC Today'])})" for _, r in fdf.iterrows())
+            lines.append(f"- {cust} · {farm}: {parts}")
         lines.append("")
-    tbl = sub[["Zone", "Customer", "Farm", "Pond", "Species", "Status", "DOC Today", "ABW"]].copy()
-    tbl["Pond"] = tbl["Pond"].astype(str)
-    return "\n".join(lines), tbl.sort_values(["Zone", "Customer", "Farm", "DOC Today"]).reset_index(drop=True)
-
-
-def _chat_answer_farm(ponds, farm_hit):
-    kind, label = farm_hit
-    if ponds.empty:
-        return f"I found **{label}**, but there are no saved records yet.", None
-    col = "Farm" if kind == "farm" else "Customer"
-    sub = ponds[ponds[col] == label]
-    if sub.empty:
-        return f"I found **{label}** in the customer list, but it has no saved records yet.", None
-
-    today = pd.Timestamp(date.today())
-    lines = []
-    for (cust, farm, zone), fdf in sub.groupby(["Customer", "Farm", "Zone"], sort=True):
-        last = fdf["Last Visit"].max()
-        days = (today - last).days
-        cnt = fdf["Status"].value_counts().to_dict()
-        active = fdf[fdf["Status"].isin(_CHAT_ACTIVE)]
-        exp = pd.to_numeric(active["Expect Harvest (KG)"], errors="coerce").sum()
-        warn = " ⚠️ overdue" if days > 7 and len(active) > 0 else ""
-        lines.append(f"### 🏭 {farm}")
-        lines.append(f"{cust} · Zone: **{zone}**")
-        lines.append(
-            f"- Last data entry: **{last:%Y-%m-%d}** ({days} day(s) ago){warn}\n"
-            f"- Ponds: **{len(fdf)}** — Running {cnt.get('Running', 0)} · Partial H {cnt.get('Partial H', 0)} · "
-            f"Full H {cnt.get('Full H', 0)} · Soon to be {cnt.get('Soon to be', 0)}\n"
-            f"- Expected harvest (active ponds): **{exp:,.0f} kg**"
-        )
-        lines.append("")
-        for _, r in fdf.iterrows():
-            sp = "V" if "vannamei" in r["Species"].lower() else ("M" if "monodon" in r["Species"].lower() else "")
-            bits = [f"**P{r['Pond']}**{' (' + sp + ')' if sp else ''}", r["Status"]]
-            if r["Status"] in _CHAT_ACTIVE or r["Status"] == "Full H":
-                if pd.notna(r["DOC Today"]):
-                    bits.append(f"DOC {int(r['DOC Today'])}")
-            if r["ABW"]:
-                bits.append(f"ABW {r['ABW']}")
-            if r["Feed/Day"]:
-                bits.append(f"Feed/Day {r['Feed/Day']}")
-            if r["Status"] in _CHAT_ACTIVE and pd.notna(r["Expect Harvest (KG)"]):
-                bits.append(f"Exp. {r['Expect Harvest (KG)']:,.0f} kg")
-            if r["Status"] in ("Partial H", "Full H") and r["Total Harvest KG"]:
-                bits.append(f"Harvested {r['Total Harvest KG']:,.0f} kg")
-            if r["Survival Rate"]:
-                bits.append(f"Survival {r['Survival Rate']}")
-            if r["Issues"]:
-                bits.append(f"⚠️ {r['Issues']}")
-            if r["WQ Special Cases"]:
-                bits.append(f"🫨 {r['WQ Special Cases']}")
-            if r["Notes"]:
-                note = r["Notes"] if len(r["Notes"]) <= 120 else r["Notes"][:117] + "..."
-                bits.append(f"📝 {note}")
-            lines.append("- " + " · ".join(bits))
-        lines.append("")
-
-    t = sub.copy()
-    t["Last Visit"] = t["Last Visit"].dt.strftime("%Y-%m-%d")
-    t["Expect Harvest (KG)"] = pd.to_numeric(t["Expect Harvest (KG)"], errors="coerce").round(0)
-    t["Pond"] = t["Pond"].astype(str)
-    table = t[["Farm", "Pond", "Species", "Status", "DOC Today", "Density", "ABW", "Feed/Day",
-               "Expect Harvest (KG)", "Survival Rate", "Issues", "Last Visit"]].reset_index(drop=True)
-    return "\n".join(lines), table
+    return "\n".join(lines), None
 
 
 def chat_answer_question(question, df, cust_df):
-    """Returns (markdown_text, optional DataFrame)."""
+    """Returns (markdown_text, optional Pond Layout HTML)."""
     q = re.sub(r"\s+", " ", question.lower()).strip()
     if not q or re.fullmatch(r"(hi|hello|hey|help|\?)[!. ]*", q):
         return "Hi! 👋 " + _CHAT_HELP, None
@@ -844,6 +1016,14 @@ def chat_answer_question(question, df, cust_df):
                     if str(z).strip() and str(z).strip().lower() != "nan"})
     zones_found = _chat_find_zones(q, zones)
     bad_zone = None if zones_found else _chat_unknown_zone_word(q)
+
+    # "situation / status / layout of <farm>" -> that farm's Pond Layout.
+    # Checked first so a farm question is never mistaken for another kind.
+    if not zones_found and re.search(r"situation|status|layout|update|condition|how is|how are", q):
+        farm_hit_any = _chat_find_farm(q, cust_df, 0.5)
+        if farm_hit_any and not re.search(r"how many|count|number of", q):
+            return _chat_answer_farm(df, farm_hit_any)
+
     farm_hit_strict = None if zones_found else _chat_find_farm(q, cust_df, 0.8)
 
     _, q_nodate = _chat_extract_dates(q)
@@ -868,8 +1048,7 @@ def chat_answer_question(question, df, cust_df):
 
     farm_hit = _chat_find_farm(q, cust_df, 0.5)
     if farm_hit:
-        ponds = _chat_build_ponds(df, cust_df)
-        return _chat_answer_farm(ponds, farm_hit)
+        return _chat_answer_farm(df, farm_hit)
 
     return "I didn't quite get that. " + _CHAT_HELP, None
 
@@ -884,7 +1063,7 @@ def _chat_clear():
 
 def _chat_container():
     try:
-        return st.container(height=460)
+        return st.container(height=520)
     except TypeError:  # older Streamlit without fixed-height containers
         return st.container()
 
@@ -894,9 +1073,14 @@ def render_ai_chatbot(load_data_fn, cust_df):
     hist = st.session_state[_CHAT_HISTORY_KEY]
 
     with st.sidebar:
+        st.markdown("---")
+        _toggle = getattr(st, "toggle", st.checkbox)
+        chat_open = _toggle("🤖 KMN AI Chatbot", value=False, key=_CHAT_OPEN_KEY)
+        if not chat_open:
+            return
+
         st.markdown(_CHAT_SIDEBAR_CSS, unsafe_allow_html=True)
-        st.markdown("### 🤖 KMN AI Chatbot")
-        st.caption("Ask about customers, farms, ponds, harvests & DOC — answers come live from the Google Sheet (read-only).")
+        st.caption("Ask about customers, farms, ponds, harvests & DOC — live from the Google Sheet (read-only).")
 
         with st.expander("💡 Try asking", expanded=False):
             for i, ex in enumerate(_CHAT_EXAMPLES):
@@ -912,24 +1096,23 @@ def render_ai_chatbot(load_data_fn, cust_df):
             hist.append({"role": "user", "content": prompt})
             with st.spinner("Checking the Google Sheet…"):
                 try:
-                    text, table = chat_answer_question(prompt, load_data_fn(), cust_df)
+                    text, layout_html = chat_answer_question(prompt, load_data_fn(), cust_df)
                 except Exception as e:
-                    text, table = f"⚠️ Sorry, I couldn't answer that. ({e})", None
-            hist.append({"role": "assistant", "content": text, "table": table})
+                    text, layout_html = f"⚠️ Sorry, I couldn't answer that. ({e})", None
+            hist.append({"role": "assistant", "content": text, "layout_html": layout_html})
 
         with chat_box:
             if not hist:
-                st.info("👋 Hi! Ask me something like *“How many ponds active in Chilaw zone?”* "
+                st.info("👋 Hi! Ask me something like *“What is the new situation of Ann Farm?”* "
                         "or tap **Try asking** above.")
             for m in hist:
                 with st.chat_message(m["role"]):
                     st.markdown(m["content"])
-                    if m.get("table") is not None and len(m["table"]) > 0:
-                        with st.expander(f"📋 View table ({len(m['table'])} rows)"):
-                            st.dataframe(m["table"], hide_index=True, use_container_width=True)
+                    if m.get("layout_html"):
+                        st.markdown(m["layout_html"], unsafe_allow_html=True)
 
 
-# Render the chatbot in the sidebar (nothing else on the page is affected).
+# Render the chatbot option in the sidebar (nothing else on the page is affected).
 render_ai_chatbot(load_data, customer_df)
 
 # =========================================================================
