@@ -1,4 +1,5 @@
 import re
+from difflib import SequenceMatcher
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +26,8 @@ from google.oauth2.service_account import Credentials
 # as removed/settled by the full manager app (Settle = 'Yes', or Harvest
 # Status = 'H') stays hidden here too, but nothing on this page can set
 # either flag itself. Everything here is read-only:
+#   0) "🤖 KMN AI Chatbot" (SIDEBAR) — ask questions about customers,
+#      farms, ponds, harvests and DOC; answers come live from the Sheet.
 #   1) "📋 Enter Customer Details" — Customer / Farm selection (used only
 #      to choose which farm's records to view)
 #   2) "📊 All Saved Records" + "🟦 Pond Layout" — a live, read-only view
@@ -272,6 +275,662 @@ for _col in REQUIRED_COLS:
     )
 
 all_customers = sorted(customer_df["Customer Name"].replace("", pd.NA).dropna().unique().tolist())
+
+# =========================================================================
+# 🤖 KMN AI CHATBOT (SIDEBAR) — NEW SECTION
+#
+# Read-only Q&A over the same Google Sheet + Customer List already loaded
+# above. Rule-based (no API key needed). It answers questions such as:
+#   * Who are the customers with Full H or Partial H ponds from 2026-10-01?
+#     Give me Zone wise Customer List.
+#   * What is the new situation of Ann Farm?
+#   * How many ponds active in Chilaw zone?
+#   * How many Vannamei ponds are in range DOC 30-60? Give me list.
+# Nothing in this block writes to either Google Sheet, and it does not
+# touch any other section of the page — it renders only inside st.sidebar.
+# =========================================================================
+_CHAT_HISTORY_KEY = "kmn_chat_history"
+_CHAT_PENDING_KEY = "kmn_chat_pending"
+
+_CHAT_EXAMPLES = [
+    "Who are the Customers having Full H or Partial H Ponds from 2026-10-01? Give me Zone wise Customer List.",
+    "What is the new situation of Ann Farm?",
+    "How many Ponds Active in Chilaw Zone?",
+    "How many Vannamei Ponds are in range DOC 30-60? Give me list",
+]
+
+_CHAT_SIDEBAR_CSS = """
+<style>
+@media (min-width: 701px) {
+    section[data-testid="stSidebar"] { min-width: 420px !important; max-width: 650px !important; }
+}
+</style>
+"""
+
+_CHAT_NAME_STOP = {"farm", "farms", "pond", "ponds", "the", "and", "of", "pvt", "ltd", "aqua", "culture"}
+_CHAT_Q_STOP = {
+    "what", "whats", "is", "the", "new", "latest", "current", "situation", "status", "update", "details",
+    "detail", "about", "tell", "show", "please", "info", "report", "of", "how", "many", "give", "me",
+    "list", "in", "are", "ponds", "pond", "farm", "farms", "zone", "who", "customers", "customer",
+    "with", "having", "from", "to", "and", "for", "all", "active", "running", "doc", "range",
+}
+_CHAT_ACTIVE = ("Running", "Partial H")
+
+_CHAT_HELP = (
+    "I can answer questions from your live Google Sheet data. Try:\n\n"
+    "- **Harvests:** *Customers with Full H or Partial H ponds from 2026-10-01, zone wise*\n"
+    "- **Farm status:** *What is the new situation of Ann Farm?*\n"
+    "- **Active ponds:** *How many ponds active in Chilaw zone?*\n"
+    "- **DOC range:** *How many Vannamei ponds are in range DOC 30-60? Give me list*"
+)
+
+_CHAT_DATE_RE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})")
+
+
+def _chat_s(v):
+    if v is None:
+        return ""
+    t = str(v).strip()
+    return "" if t.lower() == "nan" else t
+
+
+def _chat_parse_kg(raw):
+    """Same rule as the Pond Layout: '2000 (2)' = 2000 kg shared by 2 ponds."""
+    t = _chat_s(raw)
+    if not t:
+        return float("nan")
+    m = re.match(r"^([\d,]+(?:\.\d+)?)\s*\(\s*(\d+)\s*\)\s*$", t)
+    if m:
+        total = pd.to_numeric(m.group(1).replace(",", ""), errors="coerce")
+        cnt = pd.to_numeric(m.group(2), errors="coerce")
+        if pd.notna(total) and pd.notna(cnt) and cnt > 0:
+            return total / cnt
+        return float("nan")
+    return pd.to_numeric(t.replace(",", ""), errors="coerce")
+
+
+def _chat_harvest_kg_row(row):
+    tot = 0.0
+    for tcol, kcol in (("Harvest Type", "Harvest KG"), ("Harvest Type 2", "Harvest KG 2")):
+        kg = _chat_parse_kg(row.get(kcol, ""))
+        if _chat_s(row.get(tcol)) and pd.notna(kg):
+            tot += kg
+    return tot
+
+
+def _chat_doc_today(row):
+    if _chat_s(row.get("Cycle Type")) == "Soon to be":
+        return 0
+    parsed = pd.to_datetime(row.get("Date"), errors="coerce")
+    if pd.isna(parsed):
+        return None
+    try:
+        doc_num = int(float(row.get("DOC")))
+    except (TypeError, ValueError):
+        return None
+    t2 = _chat_s(row.get("Harvest Type 2")).lower()
+    t1 = _chat_s(row.get("Harvest Type")).lower()
+    full_date = ""
+    if "full" in t2:
+        full_date = _chat_s(row.get("Harvest Date 2"))
+    elif "full" in t1:
+        full_date = _chat_s(row.get("Harvest Date"))
+    if full_date:
+        fd = pd.to_datetime(full_date, errors="coerce")
+        if pd.notna(fd):
+            return doc_num + (fd - parsed).days
+    return doc_num + (pd.Timestamp(date.today()) - parsed).days
+
+
+def _chat_attach_zone(frame, cust_df):
+    z = cust_df[["Customer Name", "Farm Name with Code", "Zone"]].drop_duplicates(
+        subset=["Customer Name", "Farm Name with Code"]
+    ).rename(columns={"Customer Name": "Customer", "Farm Name with Code": "Farm"})
+    out = frame.merge(z, on=["Customer", "Farm"], how="left")
+    out["Zone"] = out["Zone"].fillna("").astype(str).str.strip().replace("", "Unknown")
+    return out
+
+
+def _chat_sort_ponds(frame):
+    cols = [c for c in ["Zone", "Customer", "Farm"] if c in frame.columns]
+    return (
+        frame.assign(_pn=pd.to_numeric(frame["Pond"], errors="coerce"))
+        .sort_values(cols + ["_pn", "Pond"])
+        .drop(columns="_pn")
+        .reset_index(drop=True)
+    )
+
+
+def _chat_build_ponds(df, cust_df):
+    """Latest saved record per Customer+Farm+Pond, with status / DOC Today."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    key = ["Customer", "Farm Name with Code", "Pond Number"]
+    d = df.copy()
+    d["_dt"] = pd.to_datetime(d["Date"], errors="coerce")
+    d = d.dropna(subset=["_dt"])
+    if d.empty:
+        return pd.DataFrame()
+
+    d["_p"] = (
+        d["Harvest Type"].astype(str).str.lower().str.contains("partial")
+        | d["Harvest Type 2"].astype(str).str.lower().str.contains("partial")
+    )
+    d["_k"] = d.apply(_chat_harvest_kg_row, axis=1)
+    partial_by = d.groupby(key)["_p"].any().to_dict()
+    kg_by = d.groupby(key)["_k"].sum().to_dict()
+
+    notes_by = {}
+    if "Notes" in d.columns:
+        ns = d[d["Notes"].astype(str).str.strip() != ""].sort_values("_dt", kind="mergesort")
+        if len(ns) > 0:
+            notes_by = ns.groupby(key)["Notes"].last().astype(str).str.strip().to_dict()
+
+    latest = d.sort_values("_dt", kind="mergesort").groupby(key, as_index=False).last()
+
+    recs = []
+    for _, r in latest.iterrows():
+        k = (r["Customer"], r["Farm Name with Code"], r["Pond Number"])
+        h_type = (_chat_s(r.get("Harvest Type 2")) or _chat_s(r.get("Harvest Type"))).lower()
+        if "full" in h_type:
+            status = "Full H"
+        elif "partial" in h_type or partial_by.get(k, False):
+            status = "Partial H"
+        elif _chat_s(r.get("Cycle Type")) == "Soon to be":
+            status = "Soon to be"
+        else:
+            status = "Running"
+
+        density = pd.to_numeric(r.get("Density"), errors="coerce")
+        surv = pd.to_numeric(r.get("Survival QTY"), errors="coerce")
+        surv_txt = (
+            f"{(surv / density) * 100:,.1f}%"
+            if pd.notna(density) and density > 0 and pd.notna(surv) else ""
+        )
+        expect = pd.to_numeric(r.get("Expect Harvest (KG)"), errors="coerce")
+
+        recs.append({
+            "Customer": r["Customer"],
+            "Farm": r["Farm Name with Code"],
+            "Pond": r["Pond Number"],
+            "Species": _chat_s(r.get("Species Culture")),
+            "Status": status,
+            "DOC Today": _chat_doc_today(r),
+            "Density": density,
+            "ABW": _chat_s(r.get("ABW")),
+            "Feed/Day": _chat_s(r.get("Feed Per Day")),
+            "Expect Harvest (KG)": expect,
+            "Survival Rate": surv_txt,
+            "Issues": _chat_s(r.get("Issues")),
+            "WQ Special Cases": _chat_s(r.get("WQ Special Cases")),
+            "Notes": notes_by.get(k, ""),
+            "Last Visit": r["_dt"],
+            "Total Harvest KG": kg_by.get(k, 0.0),
+        })
+    ponds = pd.DataFrame(recs)
+    return _chat_sort_ponds(_chat_attach_zone(ponds, cust_df))
+
+
+def _chat_build_harvest_events(df, cust_df):
+    """One row per harvest event (slot 1 and slot 2 split, like All Harvest Details)."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    slots = [
+        ("Harvest Date", "Harvest Type", "Harvest KG", "Harvest ABW", "Harvest Status"),
+        ("Harvest Date 2", "Harvest Type 2", "Harvest KG 2", "Harvest ABW 2", "Harvest Status 2"),
+    ]
+    rows = []
+    for _, r in df.iterrows():
+        for dcol, tcol, kcol, acol, scol in slots:
+            htype = _chat_s(r.get(tcol))
+            if not htype or _chat_s(r.get(scol)).upper() == "H":
+                continue
+            hd = pd.to_datetime(_chat_s(r.get(dcol)), errors="coerce")
+            if pd.isna(hd):
+                hd = pd.to_datetime(_chat_s(r.get("Date")), errors="coerce")
+            if pd.isna(hd):
+                continue
+            low = htype.lower()
+            kind = "Full H" if "full" in low else ("Partial H" if "partial" in low else htype)
+            rows.append({
+                "Customer": _chat_s(r.get("Customer")),
+                "Farm": _chat_s(r.get("Farm Name with Code")),
+                "Pond": _chat_s(r.get("Pond Number")),
+                "Harvest Type": kind,
+                "Harvest Date": hd.strftime("%Y-%m-%d"),
+                "Harvest KG": _chat_s(r.get(kcol)),
+                "Harvest ABW": _chat_s(r.get(acol)),
+                "_hd": hd,
+            })
+    if not rows:
+        return pd.DataFrame()
+    ev = pd.DataFrame(rows).drop_duplicates(
+        subset=["Customer", "Farm", "Pond", "Harvest Type", "Harvest Date"]
+    )
+    return _chat_sort_ponds(_chat_attach_zone(ev, cust_df))
+
+
+def _chat_extract_dates(q):
+    out = []
+    for y, m, d in _CHAT_DATE_RE.findall(q):
+        try:
+            out.append(pd.Timestamp(int(y), int(m), int(d)))
+        except ValueError:
+            pass
+    return out, _CHAT_DATE_RE.sub(" ", q)
+
+
+def _chat_date_window(q):
+    dates, _ = _chat_extract_dates(q)
+    today = pd.Timestamp(date.today())
+    start = end = None
+    if len(dates) >= 2:
+        start, end = min(dates), max(dates)
+    elif len(dates) == 1:
+        if re.search(r"\b(before|until|till|upto|up to|earlier than)\b", q):
+            end = dates[0]
+        else:
+            start = dates[0]
+    else:
+        m = re.search(r"last\s+(\d+)\s+days?", q)
+        if m:
+            start, end = today - pd.Timedelta(days=int(m.group(1))), today
+        elif "this month" in q:
+            start = today.replace(day=1)
+    if start is not None and end is not None:
+        label = f"between {start:%Y-%m-%d} and {end:%Y-%m-%d}"
+    elif start is not None:
+        label = f"from {start:%Y-%m-%d}"
+    elif end is not None:
+        label = f"up to {end:%Y-%m-%d}"
+    else:
+        label = "(all dates)"
+    return start, end, label
+
+
+def _chat_find_zones(q, zones):
+    found = []
+    qtoks = re.findall(r"[a-z0-9]+", q)
+    for z in zones:
+        zl = z.lower().strip()
+        if not zl:
+            continue
+        if zl.isdigit():
+            if re.search(r"zone\s*" + re.escape(zl) + r"\b", q):
+                found.append(z)
+            continue
+        if re.search(r"\b" + re.escape(zl) + r"\b", q):
+            found.append(z)
+            continue
+        ztoks = re.findall(r"[a-z0-9]+", zl)
+        if len(ztoks) == 1 and len(zl) >= 4 and any(
+            len(w) >= 4 and SequenceMatcher(None, zl, w).ratio() >= 0.85 for w in qtoks
+        ):
+            found.append(z)
+    return found
+
+
+def _chat_unknown_zone_word(q):
+    m = re.search(r"\b(\w+)\s+zone\b(?!\s*-?\s*wise)", q)
+    if m and m.group(1) not in {"the", "any", "each", "every", "a", "per", "me", "all", "by",
+                                 "this", "that", "which", "same", "whole", "in", "of", "wise"}:
+        return m.group(1)
+    return None
+
+
+def _chat_tokens(text):
+    t = re.sub(r"\(.*?\)", " ", str(text).lower())
+    return [x for x in re.findall(r"[a-z0-9]+", t) if x not in _CHAT_NAME_STOP and len(x) > 1]
+
+
+def _chat_tok_match(t, qtoks):
+    if t in qtoks:
+        return True
+    if len(t) >= 4:
+        return any(len(w) >= 4 and SequenceMatcher(None, t, w).ratio() >= 0.85 for w in qtoks)
+    return False
+
+
+def _chat_find_farm(q, cust_df, min_score):
+    qtoks = set(re.findall(r"[a-z0-9]+", q)) - _CHAT_Q_STOP
+    best = (0.0, 0, None)
+    for kind, col in (("farm", "Farm Name with Code"), ("customer", "Customer Name")):
+        for label in cust_df[col].dropna().unique():
+            toks = _chat_tokens(label)
+            if not toks:
+                continue
+            hit = sum(1 for t in toks if _chat_tok_match(t, qtoks))
+            if hit == 0:
+                continue
+            cand = (hit / len(toks), hit, (kind, label))
+            if cand[:2] > best[:2]:
+                best = cand
+    return best[2] if best[0] >= min_score else None
+
+
+def _chat_find_species(q):
+    for w in re.findall(r"[a-z]{4,}", q):
+        if w in ("vname", "vanamei") or SequenceMatcher(None, w, "vannamei").ratio() >= 0.75:
+            return "vannamei"
+        if SequenceMatcher(None, w, "monodon").ratio() >= 0.75:
+            return "monodon"
+    return None
+
+
+def _chat_doc_bounds(q, q_nodate):
+    m = re.search(r"(\d+)\s*(?:-|–|to|and)\s*(\d+)", q_nodate)
+    if m:
+        lo, hi = sorted((int(m.group(1)), int(m.group(2))))
+        return lo, hi
+    m = re.search(r"(?:above|over|more than|greater than|older than|beyond|>=?)\s*(\d+)", q_nodate)
+    if m:
+        return int(m.group(1)), None
+    m = re.search(r"(?:below|under|less than|within|upto|up to|<=?)\s*(\d+)", q_nodate)
+    if m:
+        return None, int(m.group(1))
+    m = re.search(r"doc\s*(?:of|=|is|at)?\s*(\d+)", q_nodate)
+    if m:
+        return int(m.group(1)), int(m.group(1))
+    return None
+
+
+def _chat_apply_scope(frame, zones_found, farm_hit):
+    """Returns (filtered_frame, human label)."""
+    if zones_found:
+        sub = frame[frame["Zone"].isin(zones_found)]
+        return sub, " & ".join(f"{z} zone" for z in zones_found)
+    if farm_hit:
+        kind, label = farm_hit
+        col = "Farm" if kind == "farm" else "Customer"
+        return frame[frame[col] == label], label
+    return frame, "all zones"
+
+
+def _chat_answer_harvest(q, df, cust_df, zones_found, farm_hit):
+    ev = _chat_build_harvest_events(df, cust_df)
+    if ev.empty:
+        return "No harvest records found yet.", None
+
+    want_full, want_partial = "full" in q, "partial" in q
+    if want_full and not want_partial:
+        kinds = ["Full H"]
+    elif want_partial and not want_full:
+        kinds = ["Partial H"]
+    else:
+        kinds = ["Full H", "Partial H"]
+    ev = ev[ev["Harvest Type"].isin(kinds)]
+
+    start, end, date_label = _chat_date_window(q)
+    if start is not None:
+        ev = ev[ev["_hd"] >= start]
+    if end is not None:
+        ev = ev[ev["_hd"] <= end]
+
+    ev, scope = _chat_apply_scope(ev, zones_found, farm_hit)
+    kind_label = " / ".join(kinds)
+    if ev.empty:
+        return f"No **{kind_label}** harvests found {date_label} for {scope}.", None
+
+    ev = ev.sort_values(["Zone", "Customer", "Farm", "_hd"])
+    n_full = int((ev["Harvest Type"] == "Full H").sum())
+    n_part = int((ev["Harvest Type"] == "Partial H").sum())
+    lines = [
+        f"**{ev['Customer'].nunique()} customer(s)** · {ev[['Customer', 'Farm']].drop_duplicates().shape[0]} farm(s) · "
+        f"{len(ev)} harvest event(s) ({kind_label}) {date_label} — {scope}",
+        f"Full H: {n_full} · Partial H: {n_part}",
+        "",
+    ]
+    for zone, zdf in ev.groupby("Zone", sort=True):
+        lines.append(f"**📍 {zone}** — {zdf['Customer'].nunique()} customer(s)")
+        for (cust, farm), fdf in zdf.groupby(["Customer", "Farm"], sort=True):
+            parts = ", ".join(
+                f"P{r['Pond']} {r['Harvest Type']} ({r['_hd']:%m-%d})" for _, r in fdf.iterrows()
+            )
+            lines.append(f"- **{cust}** · {farm}: {parts}")
+        lines.append("")
+    table = ev[["Zone", "Customer", "Farm", "Pond", "Harvest Type", "Harvest Date",
+                "Harvest KG", "Harvest ABW"]].reset_index(drop=True)
+    return "\n".join(lines), table
+
+
+def _chat_answer_count(q, ponds, zones_found, farm_hit):
+    if ponds.empty:
+        return "No saved pond records yet.", None
+    sub, scope = _chat_apply_scope(ponds, zones_found, farm_hit)
+    sp = _chat_find_species(q)
+    sp_txt = ""
+    if sp:
+        sub = sub[sub["Species"].str.lower().str.contains(sp)]
+        sp_txt = f" ({sp.capitalize()})"
+    if sub.empty:
+        return f"No ponds found for {scope}{sp_txt}.", None
+
+    active = sub[sub["Status"].isin(_CHAT_ACTIVE)]
+    cnt = sub["Status"].value_counts().to_dict()
+    lines = [
+        f"**{len(active)} active pond(s)** in {scope}{sp_txt}",
+        f"Running {cnt.get('Running', 0)} · Partial H {cnt.get('Partial H', 0)} "
+        f"(not counted: Full H {cnt.get('Full H', 0)}, Soon to be {cnt.get('Soon to be', 0)})",
+    ]
+    if len(active) > 0:
+        by_sp = active["Species"].replace("", "Unspecified").value_counts()
+        lines.append("By species: " + " · ".join(f"{k} {v}" for k, v in by_sp.items()))
+
+    if zones_found or farm_hit:
+        tbl = (
+            active.groupby(["Zone", "Customer", "Farm"])
+            .agg(**{"Active Ponds": ("Pond", "count"),
+                    "Pond Numbers": ("Pond", lambda s: ", ".join(map(str, s)))})
+            .reset_index()
+        )
+    else:
+        lines.append("")
+        z = sub.groupby("Zone")["Status"].value_counts().unstack(fill_value=0)
+        for c in ["Running", "Partial H", "Full H", "Soon to be"]:
+            if c not in z.columns:
+                z[c] = 0
+        z["Active"] = z["Running"] + z["Partial H"]
+        tbl = z[["Active", "Running", "Partial H", "Full H", "Soon to be"]].reset_index()
+        for _, r in tbl.iterrows():
+            lines.append(f"- **{r['Zone']}**: {int(r['Active'])} active")
+    return "\n".join(lines), tbl
+
+
+def _chat_answer_doc_range(q, ponds, zones_found, farm_hit, bounds):
+    if ponds.empty:
+        return "No saved pond records yet.", None
+    lo, hi = bounds
+    sub, scope = _chat_apply_scope(ponds, zones_found, farm_hit)
+    sub = sub[sub["Status"].isin(_CHAT_ACTIVE)]
+    sp = _chat_find_species(q)
+    sp_txt = "ponds"
+    if sp:
+        sub = sub[sub["Species"].str.lower().str.contains(sp)]
+        sp_txt = f"{sp.capitalize()} ponds"
+    doc = pd.to_numeric(sub["DOC Today"], errors="coerce")
+    mask = doc.notna()
+    if lo is not None:
+        mask &= doc >= lo
+    if hi is not None:
+        mask &= doc <= hi
+    sub = sub[mask]
+    rng = f"{lo}–{hi}" if lo is not None and hi is not None else (f"≥ {lo}" if lo is not None else f"≤ {hi}")
+    if sub.empty:
+        return f"No active {sp_txt} with DOC {rng} in {scope}.", None
+
+    lines = [f"**{len(sub)} {sp_txt}** with DOC Today {rng} — {scope}", ""]
+    for zone, zdf in sub.groupby("Zone", sort=True):
+        lines.append(f"**📍 {zone}** — {len(zdf)} pond(s)")
+        for (cust, farm), fdf in zdf.groupby(["Customer", "Farm"], sort=True):
+            parts = ", ".join(f"P{r['Pond']} (DOC {int(r['DOC Today'])})" for _, r in fdf.iterrows())
+            lines.append(f"- **{cust}** · {farm}: {parts}")
+        lines.append("")
+    tbl = sub[["Zone", "Customer", "Farm", "Pond", "Species", "Status", "DOC Today", "ABW"]].copy()
+    tbl["Pond"] = tbl["Pond"].astype(str)
+    return "\n".join(lines), tbl.sort_values(["Zone", "Customer", "Farm", "DOC Today"]).reset_index(drop=True)
+
+
+def _chat_answer_farm(ponds, farm_hit):
+    kind, label = farm_hit
+    if ponds.empty:
+        return f"I found **{label}**, but there are no saved records yet.", None
+    col = "Farm" if kind == "farm" else "Customer"
+    sub = ponds[ponds[col] == label]
+    if sub.empty:
+        return f"I found **{label}** in the customer list, but it has no saved records yet.", None
+
+    today = pd.Timestamp(date.today())
+    lines = []
+    for (cust, farm, zone), fdf in sub.groupby(["Customer", "Farm", "Zone"], sort=True):
+        last = fdf["Last Visit"].max()
+        days = (today - last).days
+        cnt = fdf["Status"].value_counts().to_dict()
+        active = fdf[fdf["Status"].isin(_CHAT_ACTIVE)]
+        exp = pd.to_numeric(active["Expect Harvest (KG)"], errors="coerce").sum()
+        warn = " ⚠️ overdue" if days > 7 and len(active) > 0 else ""
+        lines.append(f"### 🏭 {farm}")
+        lines.append(f"{cust} · Zone: **{zone}**")
+        lines.append(
+            f"- Last data entry: **{last:%Y-%m-%d}** ({days} day(s) ago){warn}\n"
+            f"- Ponds: **{len(fdf)}** — Running {cnt.get('Running', 0)} · Partial H {cnt.get('Partial H', 0)} · "
+            f"Full H {cnt.get('Full H', 0)} · Soon to be {cnt.get('Soon to be', 0)}\n"
+            f"- Expected harvest (active ponds): **{exp:,.0f} kg**"
+        )
+        lines.append("")
+        for _, r in fdf.iterrows():
+            sp = "V" if "vannamei" in r["Species"].lower() else ("M" if "monodon" in r["Species"].lower() else "")
+            bits = [f"**P{r['Pond']}**{' (' + sp + ')' if sp else ''}", r["Status"]]
+            if r["Status"] in _CHAT_ACTIVE or r["Status"] == "Full H":
+                if pd.notna(r["DOC Today"]):
+                    bits.append(f"DOC {int(r['DOC Today'])}")
+            if r["ABW"]:
+                bits.append(f"ABW {r['ABW']}")
+            if r["Feed/Day"]:
+                bits.append(f"Feed/Day {r['Feed/Day']}")
+            if r["Status"] in _CHAT_ACTIVE and pd.notna(r["Expect Harvest (KG)"]):
+                bits.append(f"Exp. {r['Expect Harvest (KG)']:,.0f} kg")
+            if r["Status"] in ("Partial H", "Full H") and r["Total Harvest KG"]:
+                bits.append(f"Harvested {r['Total Harvest KG']:,.0f} kg")
+            if r["Survival Rate"]:
+                bits.append(f"Survival {r['Survival Rate']}")
+            if r["Issues"]:
+                bits.append(f"⚠️ {r['Issues']}")
+            if r["WQ Special Cases"]:
+                bits.append(f"🫨 {r['WQ Special Cases']}")
+            if r["Notes"]:
+                note = r["Notes"] if len(r["Notes"]) <= 120 else r["Notes"][:117] + "..."
+                bits.append(f"📝 {note}")
+            lines.append("- " + " · ".join(bits))
+        lines.append("")
+
+    t = sub.copy()
+    t["Last Visit"] = t["Last Visit"].dt.strftime("%Y-%m-%d")
+    t["Expect Harvest (KG)"] = pd.to_numeric(t["Expect Harvest (KG)"], errors="coerce").round(0)
+    t["Pond"] = t["Pond"].astype(str)
+    table = t[["Farm", "Pond", "Species", "Status", "DOC Today", "Density", "ABW", "Feed/Day",
+               "Expect Harvest (KG)", "Survival Rate", "Issues", "Last Visit"]].reset_index(drop=True)
+    return "\n".join(lines), table
+
+
+def chat_answer_question(question, df, cust_df):
+    """Returns (markdown_text, optional DataFrame)."""
+    q = re.sub(r"\s+", " ", question.lower()).strip()
+    if not q or re.fullmatch(r"(hi|hello|hey|help|\?)[!. ]*", q):
+        return "Hi! 👋 " + _CHAT_HELP, None
+    if df is None or len(df) == 0:
+        return "There are no saved records in the Google Sheet yet.", None
+
+    zones = sorted({str(z).strip() for z in cust_df["Zone"].tolist()
+                    if str(z).strip() and str(z).strip().lower() != "nan"})
+    zones_found = _chat_find_zones(q, zones)
+    bad_zone = None if zones_found else _chat_unknown_zone_word(q)
+    farm_hit_strict = None if zones_found else _chat_find_farm(q, cust_df, 0.8)
+
+    _, q_nodate = _chat_extract_dates(q)
+    bounds = _chat_doc_bounds(q, q_nodate) if ("doc" in q or "days of culture" in q) else None
+
+    harvest_intent = bool(re.search(r"\b(full|partial)\b|harvest", q))
+    count_intent = bool(re.search(r"how many|count|number of|total|active|running", q)) and "pond" in q
+
+    if bounds is not None or harvest_intent or count_intent:
+        if bad_zone and not farm_hit_strict:
+            return (f"I couldn't find a zone called **{bad_zone}**. Available zones: "
+                    + ", ".join(zones) + "."), None
+
+    if bounds is not None:
+        ponds = _chat_build_ponds(df, cust_df)
+        return _chat_answer_doc_range(q, ponds, zones_found, farm_hit_strict, bounds)
+    if harvest_intent:
+        return _chat_answer_harvest(q, df, cust_df, zones_found, farm_hit_strict)
+    if count_intent:
+        ponds = _chat_build_ponds(df, cust_df)
+        return _chat_answer_count(q, ponds, zones_found, farm_hit_strict)
+
+    farm_hit = _chat_find_farm(q, cust_df, 0.5)
+    if farm_hit:
+        ponds = _chat_build_ponds(df, cust_df)
+        return _chat_answer_farm(ponds, farm_hit)
+
+    return "I didn't quite get that. " + _CHAT_HELP, None
+
+
+def _chat_set_pending(text):
+    st.session_state[_CHAT_PENDING_KEY] = text
+
+
+def _chat_clear():
+    st.session_state[_CHAT_HISTORY_KEY] = []
+
+
+def _chat_container():
+    try:
+        return st.container(height=460)
+    except TypeError:  # older Streamlit without fixed-height containers
+        return st.container()
+
+
+def render_ai_chatbot(load_data_fn, cust_df):
+    st.session_state.setdefault(_CHAT_HISTORY_KEY, [])
+    hist = st.session_state[_CHAT_HISTORY_KEY]
+
+    with st.sidebar:
+        st.markdown(_CHAT_SIDEBAR_CSS, unsafe_allow_html=True)
+        st.markdown("### 🤖 KMN AI Chatbot")
+        st.caption("Ask about customers, farms, ponds, harvests & DOC — answers come live from the Google Sheet (read-only).")
+
+        with st.expander("💡 Try asking", expanded=False):
+            for i, ex in enumerate(_CHAT_EXAMPLES):
+                st.button(ex, key=f"kmn_chat_ex_{i}", on_click=_chat_set_pending, args=(ex,),
+                          use_container_width=True)
+        st.button("🗑️ Clear chat", key="kmn_chat_clear", on_click=_chat_clear)
+
+        chat_box = _chat_container()
+        typed = st.chat_input("Ask me about your farms…", key="kmn_chat_input")
+        prompt = typed or st.session_state.pop(_CHAT_PENDING_KEY, None)
+
+        if prompt:
+            hist.append({"role": "user", "content": prompt})
+            with st.spinner("Checking the Google Sheet…"):
+                try:
+                    text, table = chat_answer_question(prompt, load_data_fn(), cust_df)
+                except Exception as e:
+                    text, table = f"⚠️ Sorry, I couldn't answer that. ({e})", None
+            hist.append({"role": "assistant", "content": text, "table": table})
+
+        with chat_box:
+            if not hist:
+                st.info("👋 Hi! Ask me something like *“How many ponds active in Chilaw zone?”* "
+                        "or tap **Try asking** above.")
+            for m in hist:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+                    if m.get("table") is not None and len(m["table"]) > 0:
+                        with st.expander(f"📋 View table ({len(m['table'])} rows)"):
+                            st.dataframe(m["table"], hide_index=True, use_container_width=True)
+
+
+# Render the chatbot in the sidebar (nothing else on the page is affected).
+render_ai_chatbot(load_data, customer_df)
 
 # =========================================================================
 # STEP 1: "Enter Customer Details" — Customer / Farm selection.
