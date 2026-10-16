@@ -273,6 +273,34 @@ for _col in REQUIRED_COLS:
 
 all_customers = sorted(customer_df["Customer Name"].replace("", pd.NA).dropna().unique().tolist())
 
+# ---- Current-season helpers -------------------------------------------------
+# A pond can be re-stocked after a Full H (new season) while its old rows stay
+# in the Sheet. Full H is detected on the pond's LATEST row only, but Partial H
+# used to be detected across ALL rows ever saved — so after a new season started
+# the old season's Partial H made the pond show as Partial H again.
+# These helpers cut a pond's history at its LAST Full H: only rows saved AFTER
+# it belong to the current season. Rows are ordered by Timestamp (not Date) so a
+# new-season row entered on the same day as the Full H still sorts after it.
+def _current_season_rows(group):
+    """Rows of one pond AFTER its last Full H (i.e. the current season)."""
+    g = group.sort_values("Timestamp", kind="mergesort").reset_index(drop=True)
+    full_flag = (
+        g["Harvest Type"].astype(str).str.lower().str.contains("full")
+        | g["Harvest Type 2"].astype(str).str.lower().str.contains("full")
+    )
+    full_positions = [i for i, f in enumerate(full_flag.tolist()) if f]
+    if full_positions:
+        g = g.iloc[full_positions[-1] + 1:]
+    return g
+
+def _has_partial_current_season(group):
+    """True if the pond recorded a Partial H in its current season."""
+    g = _current_season_rows(group)
+    return bool((
+        g["Harvest Type"].astype(str).str.lower().str.contains("partial")
+        | g["Harvest Type 2"].astype(str).str.lower().str.contains("partial")
+    ).any())
+
 # =========================================================================
 # STEP 1: "Enter Customer Details" — Customer / Farm selection.
 # For the marketing manager this is just a filter to choose whose records
@@ -565,23 +593,17 @@ if len(df_farm_summary) > 0:
         def _pond_harvest_type(prow):
             return str(prow.get("Harvest Type 2", "")).strip() or str(prow.get("Harvest Type", "")).strip()
 
-        # A pond keeps showing Partial H if ANY of its saved records ever
-        # had a Partial harvest — not just its most recent row (daily
-        # entries often leave Harvest Type blank after the harvest day).
+        # A pond keeps showing Partial H if it had a Partial harvest in its
+        # CURRENT SEASON (rows after its last Full H) — not just its most
+        # recent row (daily entries often leave Harvest Type blank after the
+        # harvest day). An older season's Partial H no longer carries over
+        # once the pond is re-stocked after a Full H.
         # Full H intentionally does NOT carry forward this way — it only
         # reflects the pond's latest record, same as before.
-        _partial_history_by_pond = (
-            df_farm_summary.assign(
-                _HasPartial=(
-                    df_farm_summary.get("Harvest Type", pd.Series("", index=df_farm_summary.index))
-                    .astype(str).str.lower().str.contains("partial")
-                    | df_farm_summary.get("Harvest Type 2", pd.Series("", index=df_farm_summary.index))
-                    .astype(str).str.lower().str.contains("partial")
-                )
-            )
-            .groupby("Pond Number")["_HasPartial"]
-            .any()
-        )
+        _partial_history_by_pond = {
+            _pn: _has_partial_current_season(_g)
+            for _pn, _g in df_farm_summary.groupby("Pond Number")
+        }
 
         # Latest NOTES per pond (the Sheet's last column, "Notes") — the most
         # recent saved record for that pond that actually has text in Notes.
@@ -644,11 +666,31 @@ if len(df_farm_summary) > 0:
                 _row_total += _kg2
             return _row_total
 
-        _total_harvest_kg_by_pond = (
-            df_farm_summary.assign(_HarvestKGRow=df_farm_summary.apply(_harvest_kg_sum_row, axis=1))
-            .groupby("Pond Number")["_HarvestKGRow"]
-            .sum()
-        )
+        # Pond Layout only: the "Total: X KG" shown on a card counts the harvests
+        # of the pond's CURRENT season only, so a restocked pond doesn't carry
+        # the previous season's harvest total.
+        #   * pond still has its latest row at Full H -> the season that just
+        #     ended (rows after the previous Full H, up to and including this one)
+        #   * new rows exist after the last Full H     -> only those new rows
+        #   * pond never had a Full H                  -> all its rows
+        def _display_season_rows(group):
+            g = group.sort_values("Timestamp", kind="mergesort").reset_index(drop=True)
+            _full_flag = (
+                g["Harvest Type"].astype(str).str.lower().str.contains("full")
+                | g["Harvest Type 2"].astype(str).str.lower().str.contains("full")
+            )
+            _full_pos = [i for i, f in enumerate(_full_flag.tolist()) if f]
+            if not _full_pos:
+                return g
+            if _full_pos[-1] == len(g) - 1:
+                _start = _full_pos[-2] + 1 if len(_full_pos) > 1 else 0
+                return g.iloc[_start:]
+            return g.iloc[_full_pos[-1] + 1:]
+
+        _total_harvest_kg_by_pond = {
+            _pn: sum(_harvest_kg_sum_row(_r) for _, _r in _display_season_rows(_g).iterrows())
+            for _pn, _g in df_farm_summary.groupby("Pond Number")
+        }
 
         def _pond_status(prow):
             _pond_no_status = prow.get("Pond Number", "")
